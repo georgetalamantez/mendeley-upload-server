@@ -53,7 +53,7 @@ GDRIVE_QUEUE = os.getenv("GDRIVE_QUEUE_FOLDER", "Mendeley_Queue").strip("/")
 GDRIVE_PROCESSED = os.getenv("GDRIVE_PROCESSED_FOLDER", f"{GDRIVE_QUEUE}/Processed").strip("/")
 
 MANIFEST_PATH = os.getenv("MANIFEST_PATH", "manifest.json")
-MAX_FILES = int(os.getenv("MAX_FILES_PER_RUN", "50"))
+MAX_FILES = int(os.getenv("MAX_FILES_PER_RUN", "10"))
 MAX_RUNTIME_SECONDS = int(os.getenv("MAX_RUNTIME_SECONDS", str(int(4.5 * 3600))))  # 4.5 hours safety ceiling
 LOCAL_STAGING_DIR = os.getenv("LOCAL_STAGING_DIR", "/tmp/mendeley_staging")
 

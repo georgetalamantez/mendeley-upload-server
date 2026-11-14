@@ -14,7 +14,7 @@ on:
       max_files:
         description: 'Maximum PDFs to process in this run'
         required: false
-        default: '50'
+        default: '10'
         type: string
 
 permissions:

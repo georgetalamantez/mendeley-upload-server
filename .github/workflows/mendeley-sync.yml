@@ -1,0 +1,99 @@
+name: Mendeley Google Drive Sync
+
+on:
+  schedule:
+    # Run every 2 hours
+    - cron: '0 */2 * * *'
+  workflow_dispatch:
+    inputs:
+      queue_folder:
+        description: 'Google Drive queue folder path'
+        required: false
+        default: 'Mendeley_Queue'
+        type: string
+      max_files:
+        description: 'Maximum PDFs to process in this run'
+        required: false
+        default: '50'
+        type: string
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360 # GitHub Actions maximum limit
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies & rclone
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rclone
+          pip install --upgrade pip
+          pip install requests
+
+      - name: Configure rclone
+        env:
+          RCLONE_CONF: ${{ secrets.RCLONE_CONFIG }}
+        run: |
+          if [ -z "$RCLONE_CONF" ]; then
+            echo "::error::RCLONE_CONFIG secret is not configured in this repository."
+            exit 1
+          fi
+          mkdir -p ~/.config/rclone
+          echo "$RCLONE_CONF" > ~/.config/rclone/rclone.conf
+          # Verify connection to remote
+          rclone listremotes
+
+      - name: Run Mendeley Cloud Sync
+        id: sync
+        env:
+          MENDELEY_CLIENT_ID: ${{ secrets.MENDELEY_CLIENT_ID }}
+          MENDELEY_CLIENT_SECRET: ${{ secrets.MENDELEY_CLIENT_SECRET }}
+          MENDELEY_REFRESH_TOKEN: ${{ secrets.MENDELEY_REFRESH_TOKEN }}
+          GDRIVE_QUEUE_FOLDER: ${{ inputs.queue_folder || 'Mendeley_Queue' }}
+          MAX_FILES_PER_RUN: ${{ inputs.max_files || '50' }}
+        run: |
+          python sync_drive_to_mendeley.py
+
+      - name: Archive Upload Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mendeley-sync-logs
+          path: mendeley_sync.log
+          retention-days: 90
+
+      - name: Commit Updated Manifest Ledger to main
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add manifest.json
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(manifest): update mendeley upload ledger [skip ci]"
+            git pull --rebase origin main
+            git push origin main
+            echo "Manifest ledger committed and pushed to main."
+          else
+            echo "No changes to manifest.json."
+          fi
+
+      - name: Trigger Follow-Up Run (If Queue Has Remaining Files)
+        if: steps.sync.outputs.has_more_files == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Queue has remaining files. Triggering subsequent workflow run..."
+          gh workflow run mendeley-sync.yml

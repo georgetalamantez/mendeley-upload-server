@@ -20,6 +20,7 @@ on:
 permissions:
   contents: write
   actions: write
+  issues: write
 
 jobs:
   sync:
@@ -89,6 +90,56 @@ jobs:
           else
             echo "No changes to manifest.json."
           fi
+
+      - name: Send Email Notification (Only When PDFs Uploaded)
+        if: success() && steps.sync.outputs.uploaded_count != '0' && steps.sync.outputs.uploaded_count != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_URL: "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        run: |
+          python3 - <<'PY'
+          import json, os, urllib.request
+
+          token = os.environ["GH_TOKEN"]
+          repo = os.environ["REPO"]
+          run_url = os.environ["RUN_URL"]
+          title = "📚 Mendeley Upload Digest"
+
+          summary = "New PDFs were uploaded from Google Drive to Mendeley."
+          if os.path.exists("run_summary.md"):
+              with open("run_summary.md", "r", encoding="utf-8") as f:
+                  summary = f.read().strip()
+
+          body = f"cc @georgetalamantez\n\n{summary}\n\n🔗 **Workflow Run:** [{run_url}]({run_url})"
+
+          def gh_api(path, method="GET", payload=None):
+              url = f"https://api.github.com/repos/{repo}/{path.lstrip('/')}"
+              headers = {
+                  "Authorization": f"Bearer {token}",
+                  "Accept": "application/vnd.github+json",
+                  "User-Agent": "Mendeley-Upload-Digest",
+              }
+              data = json.dumps(payload).encode("utf-8") if payload is not None else None
+              if data:
+                  headers["Content-Type"] = "application/json"
+              req = urllib.request.Request(url, data=data, headers=headers, method=method)
+              with urllib.request.urlopen(req) as resp:
+                  return json.loads(resp.read().decode("utf-8"))
+
+          issues = gh_api("issues?state=open&per_page=50")
+          digest_issue = next((i for i in issues if i.get("title") == title and "pull_request" not in i), None)
+
+          if not digest_issue:
+              digest_issue = gh_api("issues", method="POST", payload={
+                  "title": title,
+                  "body": "Automated email notification thread for the Mendeley Google Drive Sync workflow.\n\nComments are only posted below (`@georgetalamantez`) on runs where 1 or more new PDFs were uploaded to Mendeley."
+              })
+              print(f"Created tracking issue #{digest_issue['number']}")
+
+          comment = gh_api(f"issues/{digest_issue['number']}/comments", method="POST", payload={"body": body})
+          print(f"Posted Mendeley upload digest comment to issue #{digest_issue['number']}: {comment.get('html_url')}")
+          PY
 
       - name: Trigger Follow-Up Run (If Queue Has Remaining Files)
         if: steps.sync.outputs.has_more_files == 'true'

@@ -283,6 +283,7 @@ def main():
         logger.info("No pending files to process. Exiting cleanly.")
         write_step_summary(total_scanned=0, uploaded=0, skipped=0, errors=[], records=[])
         set_github_output("has_more_files", "false")
+        set_github_output("uploaded_count", "0")
         sys.exit(0)
 
     # Bound the batch to MAX_FILES
@@ -420,7 +421,8 @@ def main():
 
     # Step Summary & Output
     total_duration = time.time() - START_TIME
-    write_step_summary(stats["scanned"], stats["uploaded"], stats["skipped"], stats["errors"], records_summary, total_duration)
+    write_step_summary(stats["scanned"], stats["uploaded"], stats["skipped"], stats["errors"], records_summary, total_duration, len(manifest))
+    set_github_output("uploaded_count", str(stats["uploaded"]))
 
     if has_more:
         logger.info("Remaining files detected in queue. Signaling auto-continuation.")
@@ -430,20 +432,19 @@ def main():
         set_github_output("has_more_files", "false")
 
 
-def write_step_summary(total_scanned: int, uploaded: int, skipped: int, errors: List[Dict[str, str]], records: List[Dict[str, str]], duration_s: float = 0.0):
+def write_step_summary(total_scanned: int, uploaded: int, skipped: int, errors: List[Dict[str, str]], records: List[Dict[str, str]], duration_s: float = 0.0, total_manifest: int = 0):
     summary_path = os.getenv("GITHUB_STEP_SUMMARY")
-    if not summary_path:
-        return
 
     m, s = divmod(int(duration_s), 60)
     time_str = f"{m}m {s}s" if m > 0 else f"{s}s"
 
     lines = [
-        "## 📚 Mendeley Cloud Sync Run Summary",
+        f"## 📚 Mendeley Cloud Sync Summary ({datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')})",
         f"- **Total PDFs Inspected**: `{total_scanned}`",
         f"- **Successfully Uploaded**: `{uploaded}`",
         f"- **Duplicates Skipped**: `{skipped}`",
         f"- **Failed / Errors**: `{len(errors)}`",
+        f"- **Total Books in Ledger (`manifest.json`)**: `{total_manifest}`",
         f"- **Total Execution Time**: `{time_str}`",
         "",
         "### Ingestion Details",
@@ -459,11 +460,19 @@ def write_step_summary(total_scanned: int, uploaded: int, skipped: int, errors: 
         for err in errors:
             lines.append(f"- **`{err['file']}`**: `{err['error']}`")
 
+    summary_md = "\n".join(lines) + "\n"
     try:
-        with open(summary_path, "a", encoding="utf-8") as f:
-            f.write("\n".join(lines) + "\n")
+        with open("run_summary.md", "w", encoding="utf-8") as rf:
+            rf.write(summary_md)
     except Exception as e:
-        logger.warning(f"Could not write to GITHUB_STEP_SUMMARY: {e}")
+        logger.warning(f"Could not write run_summary.md: {e}")
+
+    if summary_path:
+        try:
+            with open(summary_path, "a", encoding="utf-8") as f:
+                f.write(summary_md)
+        except Exception as e:
+            logger.warning(f"Could not write to GITHUB_STEP_SUMMARY: {e}")
 
 
 def set_github_output(name: str, value: str):

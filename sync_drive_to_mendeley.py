@@ -49,11 +49,11 @@ CLIENT_SECRET = os.getenv("MENDELEY_CLIENT_SECRET")
 REFRESH_TOKEN = os.getenv("MENDELEY_REFRESH_TOKEN")
 
 GDRIVE_REMOTE = os.getenv("GDRIVE_REMOTE", "gdrive").rstrip(":")
-GDRIVE_QUEUE = os.getenv("GDRIVE_QUEUE_FOLDER", "Mendeley_Queue").strip("/")
-GDRIVE_PROCESSED = os.getenv("GDRIVE_PROCESSED_FOLDER", f"{GDRIVE_QUEUE}/Processed").strip("/")
+GDRIVE_QUEUE_RAW = os.getenv("GDRIVE_QUEUE_FOLDER", "Mendeley_Queue,books1/chapters")
+GDRIVE_QUEUES = [q.strip().strip("/") for q in GDRIVE_QUEUE_RAW.split(",") if q.strip()]
 
 MANIFEST_PATH = os.getenv("MANIFEST_PATH", "manifest.json")
-MAX_FILES = int(os.getenv("MAX_FILES_PER_RUN", "10"))
+MAX_FILES = int(os.getenv("MAX_FILES_PER_RUN", "100"))
 MAX_RUNTIME_SECONDS = int(os.getenv("MAX_RUNTIME_SECONDS", str(int(4.5 * 3600))))  # 4.5 hours safety ceiling
 LOCAL_STAGING_DIR = os.getenv("LOCAL_STAGING_DIR", "/tmp/mendeley_staging")
 
@@ -258,8 +258,7 @@ def main():
 
     logger.info("=" * 60)
     logger.info("Starting Mendeley Automated Pipeline")
-    logger.info(f"Queue: {GDRIVE_REMOTE}:{GDRIVE_QUEUE}")
-    logger.info(f"Processed: {GDRIVE_REMOTE}:{GDRIVE_PROCESSED}")
+    logger.info(f"Watched Queues: {[f'{GDRIVE_REMOTE}:{q}' for q in GDRIVE_QUEUES]}")
     logger.info(f"Max Files This Batch: {MAX_FILES}")
     logger.info(f"Safety Ceiling: {MAX_RUNTIME_SECONDS} seconds")
     logger.info("=" * 60)
@@ -271,9 +270,14 @@ def main():
     # Test authentication early
     mendeley.refresh_access_token()
 
-    pending_files = list_queue_files(GDRIVE_REMOTE, GDRIVE_QUEUE)
-    total_pending = len(pending_files)
-    logger.info(f"Found {total_pending} PDF file(s) in queue.")
+    # Collect pending (queue_dir, filename) pairs across all watched folders
+    pending_items = []
+    for q_dir in GDRIVE_QUEUES:
+        for fn in list_queue_files(GDRIVE_REMOTE, q_dir):
+            pending_items.append((q_dir, fn))
+
+    total_pending = len(pending_items)
+    logger.info(f"Found {total_pending} PDF file(s) across watched queues.")
 
     if total_pending == 0:
         logger.info("No pending files to process. Exiting cleanly.")
@@ -282,7 +286,7 @@ def main():
         sys.exit(0)
 
     # Bound the batch to MAX_FILES
-    batch_files = pending_files[:MAX_FILES]
+    batch_files = pending_items[:MAX_FILES]
     has_more = total_pending > MAX_FILES
 
     stats = {
@@ -293,7 +297,8 @@ def main():
     }
     records_summary = []
 
-    for idx, filename in enumerate(batch_files, 1):
+    for idx, (q_dir, filename) in enumerate(batch_files, 1):
+        p_dir = f"{q_dir}/Processed"
         elapsed = time.time() - START_TIME
         if elapsed > MAX_RUNTIME_SECONDS:
             logger.warning(f"Approaching runtime ceiling ({elapsed:.1f}s > {MAX_RUNTIME_SECONDS}s). Stopping batch gracefully.")
@@ -302,12 +307,12 @@ def main():
 
         file_start = time.time()
         title = os.path.splitext(filename)[0].replace("_", " ")
-        logger.info(f"[{idx}/{len(batch_files)}] Processing: {filename} ('{title}')")
+        logger.info(f"[{idx}/{len(batch_files)}] Processing ({q_dir}): {filename} ('{title}')")
 
         local_path = None
         try:
             # 1. Download file
-            local_path = download_file_from_drive(GDRIVE_REMOTE, GDRIVE_QUEUE, filename, LOCAL_STAGING_DIR)
+            local_path = download_file_from_drive(GDRIVE_REMOTE, q_dir, filename, LOCAL_STAGING_DIR)
 
             # 2. Compute local hashes
             local_sha1, local_sha256 = calculate_file_hashes(local_path)
@@ -317,10 +322,10 @@ def main():
             if local_sha256 in manifest:
                 existing = manifest[local_sha256]
                 logger.info(f"⏭️ Deduplication Tier 2 Match: Content hash {local_sha256[:12]}... already uploaded as '{existing.get('title')}' (doc_id={existing.get('mendeley_doc_id')}). Skipping.")
-                move_file_in_drive(GDRIVE_REMOTE, GDRIVE_QUEUE, GDRIVE_PROCESSED, filename)
+                move_file_in_drive(GDRIVE_REMOTE, q_dir, p_dir, filename)
                 stats["skipped"] += 1
                 records_summary.append({
-                    "file": filename,
+                    "file": f"{q_dir}/{filename}",
                     "status": "Skipped (Content Hash Match)",
                     "doc_id": existing.get("mendeley_doc_id", "Existing"),
                     "duration": f"{time.time() - file_start:.1f}s"
@@ -340,10 +345,10 @@ def main():
                     "uploaded_at": datetime.now(timezone.utc).isoformat()
                 }
                 save_manifest(MANIFEST_PATH, manifest)
-                move_file_in_drive(GDRIVE_REMOTE, GDRIVE_QUEUE, GDRIVE_PROCESSED, filename)
+                move_file_in_drive(GDRIVE_REMOTE, q_dir, p_dir, filename)
                 stats["skipped"] += 1
                 records_summary.append({
-                    "file": filename,
+                    "file": f"{q_dir}/{filename}",
                     "status": "Skipped (Catalog Title Match)",
                     "doc_id": existing_doc_id,
                     "duration": f"{time.time() - file_start:.1f}s"
@@ -377,13 +382,13 @@ def main():
             save_manifest(MANIFEST_PATH, manifest)
 
             # 9. Move file in Google Drive
-            move_file_in_drive(GDRIVE_REMOTE, GDRIVE_QUEUE, GDRIVE_PROCESSED, filename)
+            move_file_in_drive(GDRIVE_REMOTE, q_dir, p_dir, filename)
 
             duration_s = time.time() - file_start
-            logger.info(f"SUCCESS: {filename} uploaded in {duration_s:.1f}s (doc_id={doc_id})")
+            logger.info(f"SUCCESS: {q_dir}/{filename} uploaded in {duration_s:.1f}s (doc_id={doc_id})")
             stats["uploaded"] += 1
             records_summary.append({
-                "file": filename,
+                "file": f"{q_dir}/{filename}",
                 "status": "✅ Uploaded",
                 "doc_id": doc_id,
                 "duration": f"{duration_s:.1f}s"

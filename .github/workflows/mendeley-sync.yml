@@ -2,19 +2,19 @@ name: Mendeley Google Drive Sync
 
 on:
   schedule:
-    # Run every 2 hours
-    - cron: '0 */2 * * *'
+    # Run once a day at 08:00 UTC
+    - cron: '0 8 * * *'
   workflow_dispatch:
     inputs:
       queue_folder:
-        description: 'Google Drive queue folder path'
+        description: 'Comma-separated Google Drive folder paths to watch'
         required: false
-        default: 'Mendeley_Queue'
+        default: 'Mendeley_Queue,books1/chapters'
         type: string
       max_files:
         description: 'Maximum PDFs to process in this run'
         required: false
-        default: '10'
+        default: '100'
         type: string
 
 permissions:
@@ -23,8 +23,8 @@ permissions:
 
 jobs:
   sync:
-    runs-on: ubuntu-latest
-    timeout-minutes: 360 # GitHub Actions maximum limit
+    runs-on: [self-hosted, oci]
+    timeout-minutes: 360
 
     steps:
       - name: Checkout repository
@@ -35,12 +35,13 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.12'
 
       - name: Install dependencies & rclone
         run: |
-          sudo apt-get update
-          sudo apt-get install -y rclone
+          if ! command -v rclone &>/dev/null; then
+            apt-get update && apt-get install -y rclone
+          fi
           pip install --upgrade pip
           pip install requests
 
@@ -54,7 +55,6 @@ jobs:
           fi
           mkdir -p ~/.config/rclone
           echo "$RCLONE_CONF" > ~/.config/rclone/rclone.conf
-          # Verify connection to remote
           rclone listremotes
 
       - name: Run Mendeley Cloud Sync
@@ -63,8 +63,8 @@ jobs:
           MENDELEY_CLIENT_ID: ${{ secrets.MENDELEY_CLIENT_ID }}
           MENDELEY_CLIENT_SECRET: ${{ secrets.MENDELEY_CLIENT_SECRET }}
           MENDELEY_REFRESH_TOKEN: ${{ secrets.MENDELEY_REFRESH_TOKEN }}
-          GDRIVE_QUEUE_FOLDER: ${{ inputs.queue_folder || 'Mendeley_Queue' }}
-          MAX_FILES_PER_RUN: ${{ inputs.max_files || '50' }}
+          GDRIVE_QUEUE_FOLDER: ${{ inputs.queue_folder || 'Mendeley_Queue,books1/chapters' }}
+          MAX_FILES_PER_RUN: ${{ inputs.max_files || '100' }}
         run: |
           python sync_drive_to_mendeley.py
 

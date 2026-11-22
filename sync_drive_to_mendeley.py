@@ -51,6 +51,8 @@ REFRESH_TOKEN = os.getenv("MENDELEY_REFRESH_TOKEN")
 GDRIVE_REMOTE = os.getenv("GDRIVE_REMOTE", "gdrive").rstrip(":")
 GDRIVE_QUEUE_RAW = os.getenv("GDRIVE_QUEUE_FOLDER", "Mendeley_Queue,books1/chapters")
 GDRIVE_QUEUES = [q.strip().strip("/") for q in GDRIVE_QUEUE_RAW.split(",") if q.strip()]
+GDRIVE_EXCLUDE_RAW = os.getenv("GDRIVE_EXCLUDE_DIRS", "Processed,Quarantined")
+GDRIVE_EXCLUDE_DIRS = [d.strip().strip("/") for d in GDRIVE_EXCLUDE_RAW.split(",") if d.strip()]
 
 MANIFEST_PATH = os.getenv("MANIFEST_PATH", "manifest.json")
 MAX_FILES = int(os.getenv("MAX_FILES_PER_RUN", "100"))
@@ -97,37 +99,123 @@ def run_rclone(args: List[str]) -> subprocess.CompletedProcess:
     return res
 
 
-def list_queue_files(remote: str, queue_dir: str) -> List[str]:
-    """Lists pending PDF filenames in the queue directory."""
-    target = f"{remote}:{queue_dir}"
-    logger.info(f"Scanning queue at {target}...")
-    res = run_rclone(["lsf", target, "--include", "*.pdf", "--files-only", "--max-depth", "1"])
+def _remote_path(remote: str, path: str) -> str:
+    return f"{remote}:{path}" if remote else path
+
+
+def is_excluded_rel_path(rel_path: str, excluded_dirs: Optional[List[str]] = None) -> bool:
+    """Returns True if any directory segment of rel_path matches an excluded folder (case-insensitive)."""
+    excluded = {d.lower() for d in (excluded_dirs if excluded_dirs is not None else GDRIVE_EXCLUDE_DIRS)}
+    parts = [p for p in rel_path.replace("\\", "/").strip("/").split("/") if p]
+    return any(part.lower() in excluded for part in parts[:-1])
+
+
+def list_queue_files(remote: str, queue_dir: str, excluded_dirs: Optional[List[str]] = None) -> List[str]:
+    """Recursively lists pending PDF relative paths in queue_dir, excluding Processed/ and Quarantined/."""
+    excluded = excluded_dirs if excluded_dirs is not None else GDRIVE_EXCLUDE_DIRS
+    target = _remote_path(remote, queue_dir)
+    logger.info(f"Scanning queue recursively at {target} (excluding {excluded})...")
+    args = ["lsf", "-R", target, "--files-only", "--ignore-case"]
+    for ex_dir in excluded:
+        args.extend(["--filter", f"- {ex_dir}/**"])
+    args.extend(["--filter", "+ *.pdf", "--filter", "- *"])
+
+    res = run_rclone(args)
     if res.returncode != 0:
         return []
-    files = [f.strip() for f in res.stdout.strip().split("\n") if f.strip().lower().endswith(".pdf")]
+
+    files = []
+    for line in res.stdout.splitlines():
+        rel = line.strip().replace("\\", "/").lstrip("/")
+        if rel.startswith("./"):
+            rel = rel[2:]
+        if not rel or not rel.lower().endswith(".pdf"):
+            continue
+        if is_excluded_rel_path(rel, excluded):
+            continue
+        files.append(rel)
     return sorted(files)
 
 
-def download_file_from_drive(remote: str, queue_dir: str, filename: str, dest_dir: str) -> str:
-    os.makedirs(dest_dir, exist_ok=True)
-    src = f"{remote}:{queue_dir}/{filename}"
-    dest = os.path.join(dest_dir, filename)
+def download_file_from_drive(remote: str, queue_dir: str, rel_path: str, dest_dir: str) -> str:
+    rel_clean = rel_path.replace("\\", "/").lstrip("/")
+    src = _remote_path(remote, f"{queue_dir}/{rel_clean}")
+    staging_root = os.path.abspath(dest_dir)
+    dest = os.path.abspath(os.path.normpath(os.path.join(staging_root, *rel_clean.split("/"))))
+    if os.path.commonpath([staging_root, dest]) != staging_root:
+        raise ValueError(f"Unsafe relative path detected: {rel_path}")
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
     logger.info(f"Downloading {src} to {dest}...")
     res = run_rclone(["copyto", src, dest])
     if res.returncode != 0 or not os.path.exists(dest):
-        raise RuntimeError(f"Failed to download {filename} from Google Drive")
+        raise RuntimeError(f"Failed to download {rel_clean} from Google Drive")
     return dest
 
 
-def move_file_in_drive(remote: str, queue_dir: str, processed_dir: str, filename: str):
-    src = f"{remote}:{queue_dir}/{filename}"
-    dest = f"{remote}:{processed_dir}/{filename}"
+def remote_file_exists(remote: str, folder: str, filename: str) -> bool:
+    """Silently checks whether a specific filename already exists directly inside folder."""
+    target = _remote_path(remote, f"{folder}/{filename}")
+    res = subprocess.run(["rclone", "lsf", target, "--files-only"], capture_output=True, text=True)
+    return res.returncode == 0 and bool(res.stdout.strip())
+
+
+def resolve_flattened_processed_name(
+    remote: str,
+    processed_dir: str,
+    basename: str,
+    content_hash: Optional[str] = None,
+) -> str:
+    """Returns basename for flat archival in Processed/, disambiguating with a hash suffix if a file with the same name already exists."""
+    if not remote_file_exists(remote, processed_dir, basename):
+        return basename
+
+    stem, ext = os.path.splitext(basename)
+    suffix = content_hash[:8] if content_hash else str(int(time.time()))
+    candidate = f"{stem}_{suffix}{ext}"
+    if remote_file_exists(remote, processed_dir, candidate):
+        candidate = f"{stem}_{suffix}_{int(time.time())}{ext}"
+    logger.info(f"Collision detected in {processed_dir} for '{basename}'; flattening as '{candidate}' to avoid overwrite.")
+    return candidate
+
+
+def move_file_in_drive(
+    remote: str,
+    queue_dir: str,
+    processed_dir: str,
+    rel_path: str,
+    content_hash: Optional[str] = None,
+) -> bool:
+    """Moves a processed file (from root or any subfolder) flat into processed_dir without overwriting existing files."""
+    rel_clean = rel_path.replace("\\", "/").lstrip("/")
+    basename = os.path.basename(rel_clean)
+    dest_name = resolve_flattened_processed_name(remote, processed_dir, basename, content_hash=content_hash)
+    src = _remote_path(remote, f"{queue_dir}/{rel_clean}")
+    dest = _remote_path(remote, f"{processed_dir}/{dest_name}")
     logger.info(f"Moving {src} -> {dest}...")
     res = run_rclone(["moveto", src, dest])
     if res.returncode != 0:
-        logger.error(f"Failed to move {filename} in Google Drive to {processed_dir}")
+        logger.error(f"Failed to move {rel_clean} in Google Drive to {processed_dir}")
         return False
     return True
+
+
+def cleanup_staging_file(local_path: Optional[str], staging_root: str):
+    """Deletes staged file and prunes any empty intermediate staging subdirectories."""
+    if not local_path:
+        return
+    if os.path.exists(local_path):
+        try:
+            os.remove(local_path)
+        except Exception:
+            pass
+    root_abs = os.path.abspath(staging_root)
+    parent = os.path.dirname(os.path.abspath(local_path))
+    while parent != root_abs and os.path.commonpath([root_abs, parent]) == root_abs:
+        try:
+            os.rmdir(parent)
+            parent = os.path.dirname(parent)
+        except OSError:
+            break
 
 
 # --- Mendeley API Client ---
@@ -258,7 +346,8 @@ def main():
 
     logger.info("=" * 60)
     logger.info("Starting Mendeley Automated Pipeline")
-    logger.info(f"Watched Queues: {[f'{GDRIVE_REMOTE}:{q}' for q in GDRIVE_QUEUES]}")
+    logger.info(f"Watched Queues: {[_remote_path(GDRIVE_REMOTE, q) for q in GDRIVE_QUEUES]}")
+    logger.info(f"Excluded Subfolders: {GDRIVE_EXCLUDE_DIRS}")
     logger.info(f"Max Files This Batch: {MAX_FILES}")
     logger.info(f"Safety Ceiling: {MAX_RUNTIME_SECONDS} seconds")
     logger.info("=" * 60)
@@ -270,11 +359,11 @@ def main():
     # Test authentication early
     mendeley.refresh_access_token()
 
-    # Collect pending (queue_dir, filename) pairs across all watched folders
+    # Collect pending (queue_dir, rel_path) pairs recursively across all watched folders
     pending_items = []
     for q_dir in GDRIVE_QUEUES:
-        for fn in list_queue_files(GDRIVE_REMOTE, q_dir):
-            pending_items.append((q_dir, fn))
+        for rel_path in list_queue_files(GDRIVE_REMOTE, q_dir):
+            pending_items.append((q_dir, rel_path))
 
     total_pending = len(pending_items)
     logger.info(f"Found {total_pending} PDF file(s) across watched queues.")
@@ -298,7 +387,7 @@ def main():
     }
     records_summary = []
 
-    for idx, (q_dir, filename) in enumerate(batch_files, 1):
+    for idx, (q_dir, rel_path) in enumerate(batch_files, 1):
         p_dir = f"{q_dir}/Processed"
         elapsed = time.time() - START_TIME
         if elapsed > MAX_RUNTIME_SECONDS:
@@ -307,13 +396,15 @@ def main():
             break
 
         file_start = time.time()
-        title = os.path.splitext(filename)[0].replace("_", " ")
-        logger.info(f"[{idx}/{len(batch_files)}] Processing ({q_dir}): {filename} ('{title}')")
+        basename = os.path.basename(rel_path)
+        title = os.path.splitext(basename)[0].replace("_", " ")
+        display_path = f"{q_dir}/{rel_path}"
+        logger.info(f"[{idx}/{len(batch_files)}] Processing ({q_dir}): {rel_path} ('{title}')")
 
         local_path = None
         try:
             # 1. Download file
-            local_path = download_file_from_drive(GDRIVE_REMOTE, q_dir, filename, LOCAL_STAGING_DIR)
+            local_path = download_file_from_drive(GDRIVE_REMOTE, q_dir, rel_path, LOCAL_STAGING_DIR)
 
             # 2. Compute local hashes
             local_sha1, local_sha256 = calculate_file_hashes(local_path)
@@ -323,10 +414,10 @@ def main():
             if local_sha256 in manifest:
                 existing = manifest[local_sha256]
                 logger.info(f"⏭️ Deduplication Tier 2 Match: Content hash {local_sha256[:12]}... already uploaded as '{existing.get('title')}' (doc_id={existing.get('mendeley_doc_id')}). Skipping.")
-                move_file_in_drive(GDRIVE_REMOTE, q_dir, p_dir, filename)
+                move_file_in_drive(GDRIVE_REMOTE, q_dir, p_dir, rel_path, content_hash=local_sha256)
                 stats["skipped"] += 1
                 records_summary.append({
-                    "file": f"{q_dir}/{filename}",
+                    "file": display_path,
                     "status": "Skipped (Content Hash Match)",
                     "doc_id": existing.get("mendeley_doc_id", "Existing"),
                     "duration": f"{time.time() - file_start:.1f}s"
@@ -338,7 +429,8 @@ def main():
             if existing_doc_id:
                 logger.info(f"⏭️ Deduplication Tier 3 Match: Document '{title}' already exists in Mendeley with attached file (doc_id={existing_doc_id}). Skipping.")
                 manifest[local_sha256] = {
-                    "filename": filename,
+                    "filename": basename,
+                    "source_path": display_path,
                     "title": title,
                     "mendeley_doc_id": existing_doc_id,
                     "mendeley_file_id": "catalog_existing",
@@ -346,10 +438,10 @@ def main():
                     "uploaded_at": datetime.now(timezone.utc).isoformat()
                 }
                 save_manifest(MANIFEST_PATH, manifest)
-                move_file_in_drive(GDRIVE_REMOTE, q_dir, p_dir, filename)
+                move_file_in_drive(GDRIVE_REMOTE, q_dir, p_dir, rel_path, content_hash=local_sha256)
                 stats["skipped"] += 1
                 records_summary.append({
-                    "file": f"{q_dir}/{filename}",
+                    "file": display_path,
                     "status": "Skipped (Catalog Title Match)",
                     "doc_id": existing_doc_id,
                     "duration": f"{time.time() - file_start:.1f}s"
@@ -372,7 +464,8 @@ def main():
 
             # 8. Record in Manifest Ledger
             manifest[local_sha256] = {
-                "filename": filename,
+                "filename": basename,
+                "source_path": display_path,
                 "title": title,
                 "mendeley_doc_id": doc_id,
                 "mendeley_file_id": mendeley_file_id,
@@ -382,14 +475,14 @@ def main():
             }
             save_manifest(MANIFEST_PATH, manifest)
 
-            # 9. Move file in Google Drive
-            move_file_in_drive(GDRIVE_REMOTE, q_dir, p_dir, filename)
+            # 9. Move file flat into Processed/ in Google Drive
+            move_file_in_drive(GDRIVE_REMOTE, q_dir, p_dir, rel_path, content_hash=local_sha256)
 
             duration_s = time.time() - file_start
-            logger.info(f"SUCCESS: {q_dir}/{filename} uploaded in {duration_s:.1f}s (doc_id={doc_id})")
+            logger.info(f"SUCCESS: {display_path} uploaded in {duration_s:.1f}s (doc_id={doc_id})")
             stats["uploaded"] += 1
             records_summary.append({
-                "file": f"{q_dir}/{filename}",
+                "file": display_path,
                 "status": "✅ Uploaded",
                 "doc_id": doc_id,
                 "duration": f"{duration_s:.1f}s"
@@ -400,21 +493,17 @@ def main():
 
         except Exception as e:
             duration_s = time.time() - file_start
-            logger.error(f"ERROR on {filename}: {str(e)}")
-            stats["errors"].append({"file": filename, "error": str(e)})
+            logger.error(f"ERROR on {display_path}: {str(e)}")
+            stats["errors"].append({"file": display_path, "error": str(e)})
             records_summary.append({
-                "file": filename,
+                "file": display_path,
                 "status": "❌ Failed",
                 "doc_id": "N/A",
                 "duration": f"{duration_s:.1f}s"
             })
 
         finally:
-            if local_path and os.path.exists(local_path):
-                try:
-                    os.remove(local_path)
-                except Exception:
-                    pass
+            cleanup_staging_file(local_path, LOCAL_STAGING_DIR)
 
     # Save final manifest
     save_manifest(MANIFEST_PATH, manifest)

@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       queue_folder:
-        description: 'Comma-separated Google Drive folder paths to watch'
+        description: 'Comma-separated Google Drive folder paths to watch recursively (excludes Processed/ and Quarantined/)'
         required: false
         default: 'Mendeley_Queue,books1/chapters'
         type: string

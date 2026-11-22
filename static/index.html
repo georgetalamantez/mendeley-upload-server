@@ -39,6 +39,12 @@
                             <button class="btn btn-success" id="btnStart" onclick="startUpload()">Start Upload</button>
                             <button class="btn btn-danger" id="btnStop" onclick="stopUpload()" disabled>Stop</button>
                         </div>
+                        <div class="form-check mt-2">
+                            <input class="form-check-input" type="checkbox" id="recursiveCheck" checked>
+                            <label class="form-check-label" for="recursiveCheck">
+                                Include subfolders recursively (skips <code>Processed/</code> and <code>Quarantined/</code>)
+                            </label>
+                        </div>
                         <div class="form-text">Server will confirm access and start background processing.</div>
                     </div>
 
@@ -72,13 +78,14 @@
 
     async function startUpload() {
         const path = document.getElementById('pathInput').value;
+        const recursive = document.getElementById('recursiveCheck').checked;
         if (!path) return alert("Please enter a path");
 
         try {
             const res = await fetch('/api/start-upload', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({path: path})
+                body: JSON.stringify({path: path, recursive: recursive})
             });
             
             if (!res.ok) {

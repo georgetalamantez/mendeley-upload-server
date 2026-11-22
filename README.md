@@ -34,11 +34,12 @@ Then visit `http://localhost:8000` in your browser.
 ## How it Works
 
 1. **Authentication**: The server uses a **RefreshToken** stored in environment variables to authenticate with the Mendeley API.
-2. **File scanning**: When you click "Start Upload", it scans the configured directory for PDF files.
-3. **Upload Logic**:
-   - Creates a metadata entry (Document) in Mendeley using the filename as the title.
+2. **File scanning**: When you click "Start Upload", it scans the configured directory (and subfolders recursively by default, skipping `Processed/` and `Quarantined/`) for PDF files.
+3. **Google Drive Sync (`sync_drive_to_mendeley.py`)**: Recursively scans watched Drive folders (`Mendeley_Queue`, `books1/chapters`) while excluding `Processed/` and `Quarantined/`, uploads new PDFs to Mendeley, and moves processed files flat into each queue's `Processed/` folder (automatically appending a short hash suffix if a filename collision occurs).
+4. **Upload Logic**:
+   - Creates a metadata entry (Document) in Mendeley using the PDF filename as the title.
    - Uploads the PDF file content and attaches it to the Document ID.
-4. **Logging**: All successes and failures are logged to `mendeley_uploader.log`.
+5. **Logging**: All successes and failures are logged to `mendeley_uploader.log` (local server) or `mendeley_sync.log` (Google Drive sync).
 
 ## Maintenance
 

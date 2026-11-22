@@ -20,6 +20,11 @@ MENDELEY_CLIENT_ID = os.getenv("MENDELEY_CLIENT_ID")
 MENDELEY_CLIENT_SECRET = os.getenv("MENDELEY_CLIENT_SECRET")
 MENDELEY_REFRESH_TOKEN = os.getenv("MENDELEY_REFRESH_TOKEN")
 MENDELEY_REDIRECT_URI = os.getenv("MENDELEY_REDIRECT_URI", "http://localhost:8585/callback")
+EXCLUDED_DIRS = {
+    d.strip().lower()
+    for d in os.getenv("UPLOADER_EXCLUDE_DIRS", "Processed,Quarantined").split(",")
+    if d.strip()
+}
 
 if not all([MENDELEY_CLIENT_ID, MENDELEY_CLIENT_SECRET, MENDELEY_REFRESH_TOKEN]):
     print("WARNING: Missing credentials in .env file.")
@@ -163,8 +168,32 @@ def upload_file_content(access_token, document_id, file_path):
         logger.error(f"Exception uploading file '{file_path}': {str(e)}")
         return False
 
-def process_upload_task(path: str):
-    logger.info(f"Starting upload task for path: {path}")
+def collect_pdf_files(path: str, recursive: bool = True, excluded_dirs: Optional[set] = None) -> List[str]:
+    """Collects PDF files from a file path or directory (recursively by default, skipping Processed/ and Quarantined/)."""
+    excluded = EXCLUDED_DIRS if excluded_dirs is None else {d.lower() for d in excluded_dirs}
+    if os.path.isfile(path):
+        return [path] if path.lower().endswith(".pdf") else []
+    if not os.path.isdir(path):
+        return []
+
+    if not recursive:
+        return sorted(
+            os.path.join(path, fname)
+            for fname in os.listdir(path)
+            if fname.lower().endswith(".pdf") and os.path.isfile(os.path.join(path, fname))
+        )
+
+    collected: List[str] = []
+    for root, dirnames, filenames in os.walk(path):
+        dirnames[:] = sorted(d for d in dirnames if d.lower() not in excluded)
+        for fname in sorted(filenames):
+            if fname.lower().endswith(".pdf"):
+                collected.append(os.path.join(root, fname))
+    return collected
+
+
+def process_upload_task(path: str, recursive: bool = True):
+    logger.info(f"Starting upload task for path: {path} (recursive={recursive})")
     state.is_running = True
     state.should_stop = False
     state.processed_files = 0
@@ -179,16 +208,13 @@ def process_upload_task(path: str):
         return
 
     # 2. Collect Files
-    files_to_process = []
-    if os.path.isfile(path):
-        if path.lower().endswith('.pdf'):
-            files_to_process.append(path)
-    elif os.path.isdir(path):
-        files_to_process = glob.glob(os.path.join(path, "*.pdf"))
+    files_to_process = collect_pdf_files(path, recursive=recursive)
     
     state.total_files = len(files_to_process)
     logger.info(f"Found {state.total_files} PDF files to process.")
     state.status_message = f"Processing directly from {path}"
+
+    is_dir = os.path.isdir(path)
 
     # 3. Process Loop
     for idx, file_path in enumerate(files_to_process):
@@ -198,10 +224,11 @@ def process_upload_task(path: str):
             break
             
         filename = os.path.basename(file_path)
-        state.current_file = filename
+        display_name = os.path.relpath(file_path, path) if is_dir else filename
+        state.current_file = display_name
         title = os.path.splitext(filename)[0].replace('_', ' ')
         
-        logger.info(f"[{idx+1}/{state.total_files}] Processing: {filename}")
+        logger.info(f"[{idx+1}/{state.total_files}] Processing: {display_name}")
         
         try:
             # Create Doc
@@ -210,14 +237,14 @@ def process_upload_task(path: str):
                 # Upload File
                 success = upload_file_content(access_token, doc_id, file_path)
                 if success:
-                    logger.info(f"SUCCESS: {filename}")
+                    logger.info(f"SUCCESS: {display_name}")
                 else:
-                    logger.error(f"FAILURE (upload): {filename}")
+                    logger.error(f"FAILURE (upload): {display_name}")
             else:
-                 logger.error(f"FAILURE (metadata): {filename}")
+                 logger.error(f"FAILURE (metadata): {display_name}")
                  
         except Exception as e:
-            logger.error(f"CRITICAL ERROR on {filename}: {str(e)}")
+            logger.error(f"CRITICAL ERROR on {display_name}: {str(e)}")
 
         state.processed_files += 1
         
@@ -233,6 +260,7 @@ def process_upload_task(path: str):
 # --- API Models ---
 class UploadRequest(BaseModel):
     path: str
+    recursive: bool = True
 
 # --- API Endpoints ---
 @app.get("/")
@@ -247,8 +275,8 @@ async def start_upload(request: UploadRequest, background_tasks: BackgroundTasks
     if not os.path.exists(request.path):
          raise HTTPException(status_code=404, detail="Path not found.")
          
-    background_tasks.add_task(process_upload_task, request.path)
-    return {"message": "Upload started", "path": request.path}
+    background_tasks.add_task(process_upload_task, request.path, request.recursive)
+    return {"message": "Upload started", "path": request.path, "recursive": request.recursive}
 
 @app.post("/api/stop")
 def stop_upload():

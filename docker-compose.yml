@@ -1,0 +1,17 @@
+services:
+  mendeley-uploader:
+    build: .
+    container_name: mendeley-uploader
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8096:8000"
+    environment:
+      - MENDELEY_CLIENT_ID
+      - MENDELEY_CLIENT_SECRET
+      - MENDELEY_REFRESH_TOKEN
+      - APP_PASSWORD
+      - MANIFEST_PATH=/data/manifest.json
+      - LOG_FILE=/data/mendeley_uploader.log
+      - MAX_UPLOAD_MB=100
+    volumes:
+      - ./data:/data

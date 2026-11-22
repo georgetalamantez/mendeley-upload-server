@@ -1,70 +1,44 @@
 # Mendeley Upload Server
 
-A local web server to import PDF files into your Mendeley library.
+A containerized web application and automated pipeline to import PDF files (including nested subfolders) into your Mendeley library directly from your browser.
 
-## Prerequisites
+## Features
 
-- [Python 3.x](https://www.python.org/downloads/)
-- Mendeley Account
+- **Browser Folder & File Picker**: Click **Browse Folder (with Subfolders)** or drag & drop folders/PDFs directly from your computer into the browser UI (no server filesystem path required).
+- **Recursive Subfolder Support**: Automatically scans nested subfolders while skipping `Processed/` and `Quarantined/` directories.
+- **Deduplication & Integrity Verification**:
+  - Local SHA-256 content-hash deduplication via `manifest.json`
+  - Optional Mendeley catalog title pre-flight check
+  - Server-side SHA-1 `filehash` confirmation
+- **Per-File Queue & Progress UI**: Real-time progress bar, per-file status badges, live upload log, **Stop**, and **Retry Failed** controls.
+- **Optional Password Gate**: Set `APP_PASSWORD` when hosting publicly behind HTTPS/Nginx (leave unset for local-only use).
 
-## Installation
+## Quick Start (Docker Container)
 
-1. Open a terminal in this directory.
-2. Install dependencies:
+1. Inject or export your Mendeley credentials (`MENDELEY_CLIENT_ID`, `MENDELEY_CLIENT_SECRET`, `MENDELEY_REFRESH_TOKEN`) — and optionally `APP_PASSWORD` if exposing over the internet.
+2. Build and start the container:
    ```bash
-   pip install -r requirements.txt
+   docker compose up -d --build
    ```
-3. Set up environment variables:
-   - Copy `.env.example` to `.env`.
-   - Open `.env` and add your Mendeley API credentials.
+3. Open your browser to `http://localhost:8096` (or your reverse-proxied HTTPS URL).
+4. Click **Browse Folder (with Subfolders)**, pick any folder on your computer, and click **Upload to Mendeley**.
 
-## Usage
+## Local Python Usage (Without Docker)
 
-### Option 1: Automatic Start (Windows)
-Double-click `start_server.bat` to install dependencies and start the server automatically.
-This will also open the dashboard in your default browser.
-
-### Option 2: Manual Start
-Run the following command in your terminal:
 ```bash
-uvicorn main:app --reload
+pip install -r requirements.txt
+uvicorn main:app --host 127.0.0.1 --port 8000
 ```
-Then visit `http://localhost:8000` in your browser.
 
-## How it Works
+Then open `http://127.0.0.1:8000` in your browser.
 
-1. **Authentication**: The server uses a **RefreshToken** stored in environment variables to authenticate with the Mendeley API.
-2. **File scanning**: When you click "Start Upload", it scans the configured directory (and subfolders recursively by default, skipping `Processed/` and `Quarantined/`) for PDF files.
-3. **Google Drive Sync (`sync_drive_to_mendeley.py`)**: Recursively scans watched Drive folders (`Mendeley_Queue`, `books1/chapters`) while excluding `Processed/` and `Quarantined/`, uploads new PDFs to Mendeley, and moves processed files flat into each queue's `Processed/` folder (automatically appending a short hash suffix if a filename collision occurs).
-4. **Upload Logic**:
-   - Creates a metadata entry (Document) in Mendeley using the PDF filename as the title.
-   - Uploads the PDF file content and attaches it to the Document ID.
-5. **Logging**: All successes and failures are logged to `mendeley_uploader.log` (local server) or `mendeley_sync.log` (Google Drive sync).
+## Automated Google Drive Pipeline (`sync_drive_to_mendeley.py`)
 
-## Maintenance
+Recursively scans watched Google Drive folders (`Mendeley_Queue`, `books1/chapters`) while excluding `Processed/` and `Quarantined/`, uploads new PDFs to Mendeley, records them in `manifest.json`, and moves processed files flat into each queue's `Processed/` folder.
 
-### Credentials & Security
-Credentials are stored in`.env` file using environment variables.
+## Refreshing Your Mendeley Token
 
-**If the server fails with "Authentication Failed":**
-The `REFRESH_TOKEN` has likely expired or been revoked. You must generate a new one.
-
-1. Run the helper script included in this folder:
-   ```bash
-   python get_new_token.py
-   ```
-2. Follow the on-screen instructions to authorize the app in your browser.
-3. Paste the code back into the terminal.
-4. Copy the new **Refresh Token** output.
-5. Update your `.env` file with the new `MENDELEY_REFRESH_TOKEN`.
-6. Restart the server.
-
-### Adding Features
-- The frontend is in `static/index.html` (Vanilla JS/HTML).
-- The backend logic is in `main.py` (FastAPI).
-
-## Troubleshooting
-
-- **502 Bad Gateway**: Usually means Mendeley rejected the specific file (too large, corrupt, or rate limited). Check `mendeley_uploader.log`.
-- **400 Bad Request**: Often a header issue (fixed in current version).
-- **Stuck Progress**: The server retries automatically, but if it hangs, check the console output.
+If authentication fails because your refresh token expired or was revoked:
+1. Run `python get_new_token.py`
+2. Authorize in your browser and paste the returned code
+3. Update `MENDELEY_REFRESH_TOKEN` in your secret manager / environment and restart the container.

@@ -9,4 +9,5 @@ venv/
 *.spec
 dist/
 build/
+data/
 .env

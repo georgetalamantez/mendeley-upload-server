@@ -3,166 +3,157 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Mendeley Uploader</title>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-    <style>
-        .log-window {
-            height: 400px;
-            overflow-y: scroll;
-            background-color: #f8f9fa;
-            border: 1px solid #dee2e6;
-            padding: 10px;
-            font-family: monospace;
-            font-size: 0.9em;
-        }
-        .log-entry { margin-bottom: 2px; border-bottom: 1px solid #eee;}
-        .log-INFO { color: #0f5132; }
-        .log-WARNING { color: #856404; font-weight: bold;}
-        .log-ERROR { color: #842029; font-weight: bold; }
-    </style>
+    <title>Mendeley PDF Uploader</title>
+    <link rel="stylesheet" href="static/styles.css?v=1">
 </head>
-<body class="bg-light">
+<body>
+    <div class="container">
+        <header>
+            <h1>📚 Mendeley PDF Uploader</h1>
+            <p>Browse a folder (including subfolders) or drop PDFs from your computer to upload directly into your Mendeley library</p>
+        </header>
 
-<div class="container py-5">
-    <div class="row justify-content-center">
-        <div class="col-md-10">
-            <div class="card shadow-sm">
-                <div class="card-header bg-primary text-white">
-                    <h4 class="mb-0">Mendeley PDF Bulk Uploader</h4>
+        <main>
+            <!-- Connection & Ledger Status -->
+            <section id="connection-section" class="card">
+                <div class="status-row">
+                    <div>
+                        <h2 style="border:none;margin:0;padding:0;">Mendeley Library Connection</h2>
+                        <p id="connection-summary" style="color:#666;margin-top:4px;" aria-live="polite">Checking server status...</p>
+                    </div>
+                    <button id="check-connection-btn" class="btn secondary small" type="button">🔄 Verify Mendeley OAuth</button>
                 </div>
-                <div class="card-body">
-                    
-                    <div class="mb-4">
-                        <label for="pathInput" class="form-label">Folder or File Path (Absolute Path)</label>
-                        <div class="input-group">
-                            <input type="text" class="form-control" id="pathInput" placeholder="C:\\Users\\Owner\\Documents\\jan-books-2026-pdfs">
-                            <button class="btn btn-success" id="btnStart" onclick="startUpload()">Start Upload</button>
-                            <button class="btn btn-danger" id="btnStop" onclick="stopUpload()" disabled>Stop</button>
-                        </div>
-                        <div class="form-check mt-2">
-                            <input class="form-check-input" type="checkbox" id="recursiveCheck" checked>
-                            <label class="form-check-label" for="recursiveCheck">
-                                Include subfolders recursively (skips <code>Processed/</code> and <code>Quarantined/</code>)
-                            </label>
-                        </div>
-                        <div class="form-text">Server will confirm access and start background processing.</div>
+                <div id="connection-status" class="status hidden" aria-live="polite"></div>
+            </section>
+
+            <!-- Step 1: Browse Folder or Files -->
+            <section id="browse-section" class="card">
+                <h2>Step 1: Select Folder or PDF Files from Your Computer</h2>
+                <p>Click <strong>Browse Folder</strong> to pick any folder on your computer—subfolders are scanned automatically—or drag &amp; drop folders and PDFs below.</p>
+
+                <div id="dropzone" class="dropzone" tabindex="0" aria-label="Drop PDF files or folders here">
+                    <div class="dropzone-icon">📂</div>
+                    <div class="dropzone-title">Drop a folder or PDFs here</div>
+                    <div class="dropzone-subtitle">Only <code>.pdf</code> files are queued; nested subfolders are supported automatically</div>
+                    <div class="browse-buttons">
+                        <button id="browse-folder-btn" class="btn primary" type="button">📁 Browse Folder (with Subfolders)</button>
+                        <button id="browse-files-btn" class="btn secondary" type="button">📄 Browse PDF Files</button>
                     </div>
-
-                    <div class="mb-3">
-                        <h5>Status: <span id="statusMessage" class="badge bg-secondary">Idle</span></h5>
-                        <p class="mb-1">Current File: <span id="currentFile" class="text-muted">-</span></p>
-                        <div class="progress" style="height: 25px;">
-                            <div id="progressBar" class="progress-bar progress-bar-striped progress-bar-animated" role="progressbar" style="width: 0%">0%</div>
-                        </div>
-                        <div class="d-flex justify-content-between mt-1">
-                            <small>Processed: <span id="processedCount">0</span></small>
-                            <small>Total: <span id="totalCount">0</span></small>
-                        </div>
-                    </div>
-
-                    <hr>
-
-                    <h5>Process Logs</h5>
-                    <div class="log-window" id="logWindow">
-                        <!-- Logs go here -->
-                    </div>
-
+                    <!-- Hidden native pickers -->
+                    <input type="file" id="folder-input" webkitdirectory directory multiple class="hidden">
+                    <input type="file" id="files-input" accept=".pdf,application/pdf" multiple class="hidden">
                 </div>
-            </div>
-        </div>
+
+                <div class="options-grid">
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="recursive-check" checked>
+                        Include subfolders recursively
+                    </label>
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="exclude-processed-check" checked>
+                        Skip <code>Processed/</code> &amp; <code>Quarantined/</code> folders
+                    </label>
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="dedup-manifest-check" checked>
+                        Skip duplicates in ledger (SHA-256)
+                    </label>
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="dedup-catalog-check" checked>
+                        Check Mendeley catalog by title
+                    </label>
+                    <label class="select-group">
+                        <span>Doc Type:</span>
+                        <select id="doc-type-select">
+                            <option value="book" selected>Book</option>
+                            <option value="journal">Journal Article</option>
+                            <option value="book_section">Book Section / Chapter</option>
+                            <option value="report">Report</option>
+                            <option value="generic">Generic</option>
+                        </select>
+                    </label>
+                </div>
+
+                <div id="selection-status" class="status hidden" aria-live="polite"></div>
+
+                <div id="queue-container" class="hidden">
+                    <div class="queue-header">
+                        <h3>Selected PDF Queue</h3>
+                        <span id="queue-summary" class="queue-summary"></span>
+                    </div>
+                    <div class="queue-table-wrap">
+                        <table class="queue-table">
+                            <thead>
+                                <tr>
+                                    <th>File (Relative Path)</th>
+                                    <th style="width: 90px;">Size</th>
+                                    <th style="width: 145px;">Status</th>
+                                    <th style="width: 46px;"></th>
+                                </tr>
+                            </thead>
+                            <tbody id="queue-tbody"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Step 2: Upload & Progress -->
+            <section id="upload-section" class="card">
+                <h2>Step 2: Upload to Mendeley</h2>
+
+                <div class="action-bar">
+                    <button id="start-upload-btn" class="btn success" type="button" disabled>🚀 Upload to Mendeley</button>
+                    <button id="stop-upload-btn" class="btn danger" type="button" disabled>⏹️ Stop</button>
+                    <button id="retry-failed-btn" class="btn primary hidden" type="button">🔁 Retry Failed</button>
+                    <button id="clear-queue-btn" class="btn secondary" type="button" disabled>🗑️ Clear Queue</button>
+                </div>
+
+                <p class="current-file-line">Current File: <strong id="current-file">—</strong></p>
+                <div class="progress-track">
+                    <div id="progress-fill" class="progress-fill">0%</div>
+                </div>
+
+                <div class="stats-grid">
+                    <div class="stat-box success">
+                        <div class="stat-value" id="stat-uploaded">0</div>
+                        <div class="stat-label">Uploaded</div>
+                    </div>
+                    <div class="stat-box warning">
+                        <div class="stat-value" id="stat-skipped">0</div>
+                        <div class="stat-label">Duplicates Skipped</div>
+                    </div>
+                    <div class="stat-box danger">
+                        <div class="stat-value" id="stat-failed">0</div>
+                        <div class="stat-label">Failed</div>
+                    </div>
+                    <div class="stat-box">
+                        <div class="stat-value" id="stat-remaining">0</div>
+                        <div class="stat-label">Remaining</div>
+                    </div>
+                </div>
+
+                <div id="upload-status" class="status hidden" aria-live="polite"></div>
+            </section>
+
+            <!-- Step 3: Live Activity Log -->
+            <section id="log-section" class="card">
+                <div class="log-header">
+                    <h2 style="border:none;margin:0;padding:0;">Upload Log</h2>
+                    <button id="clear-log-btn" class="btn secondary small" type="button">Clear Log</button>
+                </div>
+                <div id="log-window" class="log-window" aria-live="polite">
+                    <div class="log-entry log-INFO">Ready. Browse a folder or drop PDFs above to begin.</div>
+                </div>
+            </section>
+        </main>
+
+        <footer>
+            <p>
+                Mendeley PDF Uploader &bull; Containerized Web Edition
+                <span id="logout-wrap" class="hidden"> &bull; <a href="logout">Sign Out</a></span>
+            </p>
+        </footer>
     </div>
-</div>
 
-<script>
-    let pollInterval = null;
-
-    async function startUpload() {
-        const path = document.getElementById('pathInput').value;
-        const recursive = document.getElementById('recursiveCheck').checked;
-        if (!path) return alert("Please enter a path");
-
-        try {
-            const res = await fetch('/api/start-upload', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({path: path, recursive: recursive})
-            });
-            
-            if (!res.ok) {
-                const err = await res.json();
-                return alert("Error: " + err.detail);
-            }
-            
-            document.getElementById('btnStart').disabled = true;
-            document.getElementById('btnStop').disabled = false;
-            startPolling();
-            
-        } catch (e) {
-            alert("Network Error: " + e);
-        }
-    }
-
-    async function stopUpload() {
-        await fetch('/api/stop', {method: 'POST'});
-    }
-
-    function startPolling() {
-        if (pollInterval) clearInterval(pollInterval);
-        pollInterval = setInterval(updateStatus, 1000);
-    }
-
-    async function updateStatus() {
-        try {
-            // Fetch Status
-            const statusRes = await fetch('/api/status');
-            const status = await statusRes.json();
-
-            document.getElementById('statusMessage').innerText = status.status_message;
-            document.getElementById('currentFile').innerText = status.current_file || "-";
-            document.getElementById('processedCount').innerText = status.processed_files;
-            document.getElementById('totalCount').innerText = status.total_files;
-
-            if (status.total_files > 0) {
-                const pct = Math.round((status.processed_files / status.total_files) * 100);
-                const bar = document.getElementById('progressBar');
-                bar.style.width = pct + "%";
-                bar.innerText = pct + "%";
-            }
-
-            if (!status.is_running) {
-                 document.getElementById('btnStart').disabled = false;
-                 document.getElementById('btnStop').disabled = true;
-                 document.getElementById('statusMessage').className = "badge bg-success";
-            } else {
-                 document.getElementById('statusMessage').className = "badge bg-warning text-dark";
-            }
-
-            // Fetch Logs
-            const logRes = await fetch('/api/logs');
-            const logData = await logRes.json();
-            renderLogs(logData.logs);
-
-        } catch (e) {
-            console.error("Polling error", e);
-        }
-    }
-
-    function renderLogs(logs) {
-        const win = document.getElementById('logWindow');
-        win.innerHTML = logs.map(line => {
-             let cls = "";
-             if (line.includes("INFO")) cls = "log-INFO";
-             if (line.includes("WARNING")) cls = "log-WARNING";
-             if (line.includes("ERROR")) cls = "log-ERROR";
-             return `<div class="log-entry ${cls}">${line}</div>`;
-        }).join('');
-        win.scrollTop = win.scrollHeight;
-    }
-    
-    // Initial fetch
-    updateStatus();
-    startPolling();
-
-</script>
+    <script src="static/app.js?v=1"></script>
 </body>
 </html>

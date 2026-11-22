@@ -16,6 +16,11 @@ on:
         required: false
         default: '100'
         type: string
+      auto_continue:
+        description: 'Automatically trigger follow-up run if more files remain'
+        required: false
+        default: true
+        type: boolean
 
 permissions:
   contents: write
@@ -142,9 +147,10 @@ jobs:
           PY
 
       - name: Trigger Follow-Up Run (If Queue Has Remaining Files)
-        if: steps.sync.outputs.has_more_files == 'true'
+        if: steps.sync.outputs.has_more_files == 'true' && (github.event_name != 'workflow_dispatch' || inputs.auto_continue != false)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           echo "Queue has remaining files. Triggering subsequent workflow run..."
+          sleep 15
           gh workflow run mendeley-sync.yml

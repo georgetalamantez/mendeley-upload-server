@@ -99,6 +99,37 @@ class TestDriveSyncSubfolders(unittest.TestCase):
             with self.assertRaises(ValueError):
                 sync_mod.download_file_from_drive("", tmp, "../../etc/passwd.pdf", tmp)
 
+    def test_rclone_rate_limit_backoff_and_retry(self):
+        self.assertTrue(
+            sync_mod.is_rate_limit_error(
+                "googleapi: Error 403: Quota exceeded for quota metric 'Queries', rateLimitExceeded"
+            )
+        )
+        self.assertFalse(sync_mod.is_rate_limit_error("file not found"))
+
+        fake_403 = mock.Mock(returncode=1, stdout="", stderr="googleapi: Error 403: Quota exceeded, rateLimitExceeded")
+        fake_ok = mock.Mock(returncode=0, stdout="ok.pdf\n", stderr="")
+
+        with mock.patch.object(sync_mod.subprocess, "run", side_effect=[fake_403, fake_403, fake_ok]) as m_run, \
+             mock.patch.object(sync_mod.time, "sleep") as m_sleep:
+            res = sync_mod.run_rclone(["lsf", "gdrive:Mendeley_Queue"], max_retries=3, backoff_base=5.0)
+
+        self.assertEqual(res.returncode, 0)
+        self.assertEqual(m_run.call_count, 3)
+        self.assertEqual(m_sleep.call_count, 2)
+        # Verify pacing flags were injected for remote call
+        called_cmd = m_run.call_args_list[0].args[0]
+        self.assertIn("--tpslimit", called_cmd)
+        self.assertIn("--drive-pacer-min-sleep", called_cmd)
+
+    def test_resolved_processed_name_uses_known_cache_without_rclone(self):
+        cache = {"01_Chapter.pdf"}
+        with mock.patch.object(sync_mod, "remote_file_exists", side_effect=AssertionError("should use cache")):
+            name = sync_mod.resolve_flattened_processed_name(
+                "gdrive", "Mendeley_Queue/Processed", "01_Chapter.pdf", content_hash="abcdef123456", known_processed=cache
+            )
+        self.assertEqual(name, "01_Chapter_abcdef12.pdf")
+
 
 class TestLocalUploaderSubfolders(unittest.TestCase):
     def test_collect_pdf_files_recursive_and_non_recursive(self):

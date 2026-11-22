@@ -14,11 +14,12 @@ import sys
 import time
 import json
 import glob
+import random
 import hashlib
 import logging
 import subprocess
 from datetime import datetime, timezone
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Set
 import requests
 
 # --- Logging Setup ---
@@ -59,6 +60,13 @@ MAX_FILES = int(os.getenv("MAX_FILES_PER_RUN", "100"))
 MAX_RUNTIME_SECONDS = int(os.getenv("MAX_RUNTIME_SECONDS", str(int(4.5 * 3600))))  # 4.5 hours safety ceiling
 LOCAL_STAGING_DIR = os.getenv("LOCAL_STAGING_DIR", "/tmp/mendeley_staging")
 
+# Rclone Google Drive rate-limit mitigation settings
+RCLONE_TPSLIMIT = os.getenv("RCLONE_TPSLIMIT", "1")
+RCLONE_DRIVE_PACER_MIN_SLEEP = os.getenv("RCLONE_DRIVE_PACER_MIN_SLEEP", "500ms")
+RCLONE_MAX_RETRIES = int(os.getenv("RCLONE_MAX_RETRIES", "5"))
+RCLONE_BACKOFF_BASE = float(os.getenv("RCLONE_BACKOFF_BASE", "20"))
+RCLONE_BACKOFF_MAX = float(os.getenv("RCLONE_BACKOFF_MAX", "120"))
+
 START_TIME = time.time()
 
 
@@ -91,11 +99,72 @@ def save_manifest(path: str, manifest: Dict[str, Any]):
 
 
 # --- Rclone CLI Helpers ---
-def run_rclone(args: List[str]) -> subprocess.CompletedProcess:
-    cmd = ["rclone"] + args
-    res = subprocess.run(cmd, capture_output=True, text=True)
-    if res.returncode != 0:
-        logger.error(f"rclone command failed: {' '.join(cmd)}\nStderr: {res.stderr.strip()}")
+RATE_LIMIT_MARKERS = (
+    "ratelimitexceeded",
+    "rate_limit_exceeded",
+    "userratelimitexceeded",
+    "quota exceeded",
+    "too many requests",
+    "error 429",
+    "http 429",
+)
+
+
+def is_rate_limit_error(stderr: str) -> bool:
+    low = (stderr or "").lower()
+    return any(marker in low for marker in RATE_LIMIT_MARKERS)
+
+
+def _uses_rclone_remote(args: List[str]) -> bool:
+    for arg in args:
+        if arg.startswith("-"):
+            continue
+        # Match rclone remote syntax like "gdrive:path" (ignore single-letter Windows drive paths like C:\)
+        if ":" in arg and not (len(arg) >= 2 and arg[1] == ":" and arg[0].isalpha() and (len(arg) == 2 or arg[2] in ("\\", "/"))):
+            return True
+    return False
+
+
+def run_rclone(
+    args: List[str],
+    max_retries: Optional[int] = None,
+    backoff_base: Optional[float] = None,
+    quiet_on_error: bool = False,
+) -> subprocess.CompletedProcess:
+    retries = RCLONE_MAX_RETRIES if max_retries is None else max_retries
+    base_delay = RCLONE_BACKOFF_BASE if backoff_base is None else backoff_base
+
+    cmd = ["rclone"] + list(args)
+    if _uses_rclone_remote(args):
+        cmd.extend([
+            "--tpslimit", str(RCLONE_TPSLIMIT),
+            "--tpslimit-burst", "1",
+            "--drive-pacer-min-sleep", str(RCLONE_DRIVE_PACER_MIN_SLEEP),
+            "--retries", "3",
+            "--retries-sleep", "10s",
+            "--low-level-retries", "8",
+        ])
+
+    res = None
+    for attempt in range(retries + 1):
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode == 0:
+            return res
+
+        stderr_text = (res.stderr or "").strip()
+        if is_rate_limit_error(stderr_text) and attempt < retries:
+            delay = min(base_delay * (2 ** attempt), RCLONE_BACKOFF_MAX) + random.uniform(0.5, 3.0)
+            logger.warning(
+                f"Google Drive rate limit hit on rclone (attempt {attempt + 1}/{retries + 1}). "
+                f"Backing off {delay:.1f}s before retrying..."
+            )
+            time.sleep(delay)
+            continue
+
+        if not quiet_on_error:
+            logger.error(f"rclone command failed: {' '.join(cmd)}\nStderr: {stderr_text}")
+        return res
+
     return res
 
 
@@ -110,18 +179,27 @@ def is_excluded_rel_path(rel_path: str, excluded_dirs: Optional[List[str]] = Non
     return any(part.lower() in excluded for part in parts[:-1])
 
 
-def list_queue_files(remote: str, queue_dir: str, excluded_dirs: Optional[List[str]] = None) -> List[str]:
+def list_queue_files(
+    remote: str,
+    queue_dir: str,
+    excluded_dirs: Optional[List[str]] = None,
+    raise_on_error: bool = False,
+) -> List[str]:
     """Recursively lists pending PDF relative paths in queue_dir, excluding Processed/ and Quarantined/."""
     excluded = excluded_dirs if excluded_dirs is not None else GDRIVE_EXCLUDE_DIRS
     target = _remote_path(remote, queue_dir)
     logger.info(f"Scanning queue recursively at {target} (excluding {excluded})...")
     args = ["lsf", "-R", target, "--files-only", "--ignore-case"]
+    if remote:
+        args.append("--fast-list")
     for ex_dir in excluded:
         args.extend(["--filter", f"- {ex_dir}/**"])
     args.extend(["--filter", "+ *.pdf", "--filter", "- *"])
 
     res = run_rclone(args)
     if res.returncode != 0:
+        if raise_on_error:
+            raise RuntimeError(f"Failed to scan {target}: {(res.stderr or '').strip()[:300]}")
         return []
 
     files = []
@@ -135,6 +213,23 @@ def list_queue_files(remote: str, queue_dir: str, excluded_dirs: Optional[List[s
             continue
         files.append(rel)
     return sorted(files)
+
+
+def list_processed_filenames(remote: str, processed_dir: str) -> Optional[Set[str]]:
+    """Fetches existing filenames directly in processed_dir once so per-file collision checks avoid extra Drive API calls."""
+    target = _remote_path(remote, processed_dir)
+    args = ["lsf", target, "--files-only"]
+    if remote:
+        args.append("--fast-list")
+    res = run_rclone(args, quiet_on_error=True)
+    if res.returncode != 0:
+        # Processed/ might not exist yet on first run; treat directory-not-found as empty set
+        low = (res.stderr or "").lower()
+        if "directory not found" in low or "not found" in low:
+            return set()
+        logger.warning(f"Could not pre-list {target}; will fall back to per-file collision checks.")
+        return None
+    return {line.strip() for line in res.stdout.splitlines() if line.strip()}
 
 
 def download_file_from_drive(remote: str, queue_dir: str, rel_path: str, dest_dir: str) -> str:
@@ -155,7 +250,7 @@ def download_file_from_drive(remote: str, queue_dir: str, rel_path: str, dest_di
 def remote_file_exists(remote: str, folder: str, filename: str) -> bool:
     """Silently checks whether a specific filename already exists directly inside folder."""
     target = _remote_path(remote, f"{folder}/{filename}")
-    res = subprocess.run(["rclone", "lsf", target, "--files-only"], capture_output=True, text=True)
+    res = run_rclone(["lsf", target, "--files-only"], quiet_on_error=True)
     return res.returncode == 0 and bool(res.stdout.strip())
 
 
@@ -164,15 +259,21 @@ def resolve_flattened_processed_name(
     processed_dir: str,
     basename: str,
     content_hash: Optional[str] = None,
+    known_processed: Optional[Set[str]] = None,
 ) -> str:
     """Returns basename for flat archival in Processed/, disambiguating with a hash suffix if a file with the same name already exists."""
-    if not remote_file_exists(remote, processed_dir, basename):
+    def _exists(name: str) -> bool:
+        if known_processed is not None:
+            return name in known_processed
+        return remote_file_exists(remote, processed_dir, name)
+
+    if not _exists(basename):
         return basename
 
     stem, ext = os.path.splitext(basename)
     suffix = content_hash[:8] if content_hash else str(int(time.time()))
     candidate = f"{stem}_{suffix}{ext}"
-    if remote_file_exists(remote, processed_dir, candidate):
+    if _exists(candidate):
         candidate = f"{stem}_{suffix}_{int(time.time())}{ext}"
     logger.info(f"Collision detected in {processed_dir} for '{basename}'; flattening as '{candidate}' to avoid overwrite.")
     return candidate
@@ -184,11 +285,14 @@ def move_file_in_drive(
     processed_dir: str,
     rel_path: str,
     content_hash: Optional[str] = None,
+    known_processed: Optional[Set[str]] = None,
 ) -> bool:
     """Moves a processed file (from root or any subfolder) flat into processed_dir without overwriting existing files."""
     rel_clean = rel_path.replace("\\", "/").lstrip("/")
     basename = os.path.basename(rel_clean)
-    dest_name = resolve_flattened_processed_name(remote, processed_dir, basename, content_hash=content_hash)
+    dest_name = resolve_flattened_processed_name(
+        remote, processed_dir, basename, content_hash=content_hash, known_processed=known_processed
+    )
     src = _remote_path(remote, f"{queue_dir}/{rel_clean}")
     dest = _remote_path(remote, f"{processed_dir}/{dest_name}")
     logger.info(f"Moving {src} -> {dest}...")
@@ -196,6 +300,8 @@ def move_file_in_drive(
     if res.returncode != 0:
         logger.error(f"Failed to move {rel_clean} in Google Drive to {processed_dir}")
         return False
+    if known_processed is not None:
+        known_processed.add(dest_name)
     return True
 
 
@@ -361,14 +467,25 @@ def main():
 
     # Collect pending (queue_dir, rel_path) pairs recursively across all watched folders
     pending_items = []
+    scan_failures = []
     for q_dir in GDRIVE_QUEUES:
-        for rel_path in list_queue_files(GDRIVE_REMOTE, q_dir):
-            pending_items.append((q_dir, rel_path))
+        try:
+            for rel_path in list_queue_files(GDRIVE_REMOTE, q_dir, raise_on_error=True):
+                pending_items.append((q_dir, rel_path))
+        except Exception as e:
+            logger.error(f"Queue scan failed for {q_dir}: {e}")
+            scan_failures.append({"file": f"{q_dir} (scan)", "error": str(e)})
 
     total_pending = len(pending_items)
     logger.info(f"Found {total_pending} PDF file(s) across watched queues.")
 
     if total_pending == 0:
+        if scan_failures:
+            logger.error("All queue scans failed (likely Google Drive rate limit). Exiting with error instead of assuming empty queue.")
+            write_step_summary(total_scanned=0, uploaded=0, skipped=0, errors=scan_failures, records=[], duration_s=time.time() - START_TIME, total_manifest=len(manifest))
+            set_github_output("has_more_files", "false")
+            set_github_output("uploaded_count", "0")
+            sys.exit(1)
         logger.info("No pending files to process. Exiting cleanly.")
         write_step_summary(total_scanned=0, uploaded=0, skipped=0, errors=[], records=[])
         set_github_output("has_more_files", "false")
@@ -379,16 +496,22 @@ def main():
     batch_files = pending_items[:MAX_FILES]
     has_more = total_pending > MAX_FILES
 
+    # Pre-load Processed/ filename caches once per active queue to avoid per-file Drive API lookups
+    processed_caches: Dict[str, Optional[Set[str]]] = {}
+    for q_dir in sorted({q for q, _ in batch_files}):
+        processed_caches[q_dir] = list_processed_filenames(GDRIVE_REMOTE, f"{q_dir}/Processed")
+
     stats = {
         "scanned": len(batch_files),
         "uploaded": 0,
         "skipped": 0,
-        "errors": []
+        "errors": list(scan_failures),
     }
     records_summary = []
 
     for idx, (q_dir, rel_path) in enumerate(batch_files, 1):
         p_dir = f"{q_dir}/Processed"
+        known_processed = processed_caches.get(q_dir)
         elapsed = time.time() - START_TIME
         if elapsed > MAX_RUNTIME_SECONDS:
             logger.warning(f"Approaching runtime ceiling ({elapsed:.1f}s > {MAX_RUNTIME_SECONDS}s). Stopping batch gracefully.")
@@ -414,7 +537,7 @@ def main():
             if local_sha256 in manifest:
                 existing = manifest[local_sha256]
                 logger.info(f"⏭️ Deduplication Tier 2 Match: Content hash {local_sha256[:12]}... already uploaded as '{existing.get('title')}' (doc_id={existing.get('mendeley_doc_id')}). Skipping.")
-                move_file_in_drive(GDRIVE_REMOTE, q_dir, p_dir, rel_path, content_hash=local_sha256)
+                move_file_in_drive(GDRIVE_REMOTE, q_dir, p_dir, rel_path, content_hash=local_sha256, known_processed=known_processed)
                 stats["skipped"] += 1
                 records_summary.append({
                     "file": display_path,
@@ -438,7 +561,7 @@ def main():
                     "uploaded_at": datetime.now(timezone.utc).isoformat()
                 }
                 save_manifest(MANIFEST_PATH, manifest)
-                move_file_in_drive(GDRIVE_REMOTE, q_dir, p_dir, rel_path, content_hash=local_sha256)
+                move_file_in_drive(GDRIVE_REMOTE, q_dir, p_dir, rel_path, content_hash=local_sha256, known_processed=known_processed)
                 stats["skipped"] += 1
                 records_summary.append({
                     "file": display_path,
@@ -476,7 +599,7 @@ def main():
             save_manifest(MANIFEST_PATH, manifest)
 
             # 9. Move file flat into Processed/ in Google Drive
-            move_file_in_drive(GDRIVE_REMOTE, q_dir, p_dir, rel_path, content_hash=local_sha256)
+            move_file_in_drive(GDRIVE_REMOTE, q_dir, p_dir, rel_path, content_hash=local_sha256, known_processed=known_processed)
 
             duration_s = time.time() - file_start
             logger.info(f"SUCCESS: {display_path} uploaded in {duration_s:.1f}s (doc_id={doc_id})")
@@ -501,6 +624,8 @@ def main():
                 "doc_id": "N/A",
                 "duration": f"{duration_s:.1f}s"
             })
+            # Brief pause after failures so we don't hammer Google Drive in a tight loop
+            time.sleep(3.0)
 
         finally:
             cleanup_staging_file(local_path, LOCAL_STAGING_DIR)

@@ -15,11 +15,15 @@ import time
 import json
 import glob
 import random
+import socket
 import hashlib
 import logging
+import tempfile
+import threading
 import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
-from typing import Dict, Any, List, Optional, Set
+from typing import Dict, Any, List, Optional, Set, Tuple
 import requests
 
 # --- Logging Setup ---
@@ -56,16 +60,22 @@ GDRIVE_EXCLUDE_RAW = os.getenv("GDRIVE_EXCLUDE_DIRS", "Processed,Quarantined")
 GDRIVE_EXCLUDE_DIRS = [d.strip().strip("/") for d in GDRIVE_EXCLUDE_RAW.split(",") if d.strip()]
 
 MANIFEST_PATH = os.getenv("MANIFEST_PATH", "manifest.json")
-MAX_FILES = int(os.getenv("MAX_FILES_PER_RUN", "100"))
+MAX_FILES = int(os.getenv("MAX_FILES_PER_RUN", "500"))
 MAX_RUNTIME_SECONDS = int(os.getenv("MAX_RUNTIME_SECONDS", str(int(4.5 * 3600))))  # 4.5 hours safety ceiling
 LOCAL_STAGING_DIR = os.getenv("LOCAL_STAGING_DIR", "/tmp/mendeley_staging")
 
-# Rclone Google Drive rate-limit mitigation settings
-RCLONE_TPSLIMIT = os.getenv("RCLONE_TPSLIMIT", "1")
-RCLONE_DRIVE_PACER_MIN_SLEEP = os.getenv("RCLONE_DRIVE_PACER_MIN_SLEEP", "500ms")
+# Throughput & Rclone Google Drive pacing settings (tuned for dedicated personal GCP OAuth client)
+RCLONE_TPSLIMIT = os.getenv("RCLONE_TPSLIMIT", "10")
+RCLONE_TPSLIMIT_BURST = os.getenv("RCLONE_TPSLIMIT_BURST", "10")
+RCLONE_DRIVE_PACER_MIN_SLEEP = os.getenv("RCLONE_DRIVE_PACER_MIN_SLEEP", "50ms")
+RCLONE_TRANSFERS = os.getenv("RCLONE_TRANSFERS", "8")
+RCLONE_CHECKERS = os.getenv("RCLONE_CHECKERS", "16")
 RCLONE_MAX_RETRIES = int(os.getenv("RCLONE_MAX_RETRIES", "5"))
-RCLONE_BACKOFF_BASE = float(os.getenv("RCLONE_BACKOFF_BASE", "20"))
+RCLONE_BACKOFF_BASE = float(os.getenv("RCLONE_BACKOFF_BASE", "10"))
 RCLONE_BACKOFF_MAX = float(os.getenv("RCLONE_BACKOFF_MAX", "120"))
+UPLOAD_WORKERS = max(1, int(os.getenv("UPLOAD_WORKERS", "4")))
+FILE_PACE_SECONDS = float(os.getenv("FILE_PACE_SECONDS", "0.2"))
+MANIFEST_SAVE_INTERVAL = max(1, int(os.getenv("MANIFEST_SAVE_INTERVAL", "25")))
 
 START_TIME = time.time()
 
@@ -94,8 +104,10 @@ def load_manifest(path: str) -> Dict[str, Any]:
 
 
 def save_manifest(path: str, manifest: Dict[str, Any]):
-    with open(path, "w", encoding="utf-8") as f:
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2, sort_keys=True)
+    os.replace(tmp_path, path)
 
 
 # --- Rclone CLI Helpers ---
@@ -138,10 +150,10 @@ def run_rclone(
     if _uses_rclone_remote(args):
         cmd.extend([
             "--tpslimit", str(RCLONE_TPSLIMIT),
-            "--tpslimit-burst", "1",
+            "--tpslimit-burst", str(RCLONE_TPSLIMIT_BURST),
             "--drive-pacer-min-sleep", str(RCLONE_DRIVE_PACER_MIN_SLEEP),
             "--retries", "3",
-            "--retries-sleep", "10s",
+            "--retries-sleep", "5s",
             "--low-level-retries", "8",
         ])
 
@@ -232,19 +244,189 @@ def list_processed_filenames(remote: str, processed_dir: str) -> Optional[Set[st
     return {line.strip() for line in res.stdout.splitlines() if line.strip()}
 
 
+def _safe_staging_dest(staging_root: str, rel_path: str) -> str:
+    rel_clean = rel_path.replace("\\", "/").lstrip("/")
+    root_abs = os.path.abspath(staging_root)
+    dest = os.path.abspath(os.path.normpath(os.path.join(root_abs, *rel_clean.split("/"))))
+    if os.path.commonpath([root_abs, dest]) != root_abs:
+        raise ValueError(f"Unsafe relative path detected: {rel_path}")
+    return dest
+
+
 def download_file_from_drive(remote: str, queue_dir: str, rel_path: str, dest_dir: str) -> str:
     rel_clean = rel_path.replace("\\", "/").lstrip("/")
     src = _remote_path(remote, f"{queue_dir}/{rel_clean}")
-    staging_root = os.path.abspath(dest_dir)
-    dest = os.path.abspath(os.path.normpath(os.path.join(staging_root, *rel_clean.split("/"))))
-    if os.path.commonpath([staging_root, dest]) != staging_root:
-        raise ValueError(f"Unsafe relative path detected: {rel_path}")
+    dest = _safe_staging_dest(dest_dir, rel_clean)
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     logger.info(f"Downloading {src} to {dest}...")
     res = run_rclone(["copyto", src, dest])
     if res.returncode != 0 or not os.path.exists(dest):
         raise RuntimeError(f"Failed to download {rel_clean} from Google Drive")
     return dest
+
+
+def batch_download_from_drive(
+    remote: str,
+    queue_dir: str,
+    rel_paths: List[str],
+    dest_dir: str,
+) -> Dict[str, str]:
+    """Downloads many PDFs from queue_dir in a single parallel rclone copy call with a warm directory cache."""
+    if not rel_paths:
+        return {}
+
+    os.makedirs(dest_dir, exist_ok=True)
+    expected: Dict[str, str] = {}
+    clean_lines: List[str] = []
+    for rel_path in rel_paths:
+        rel_clean = rel_path.replace("\\", "/").lstrip("/")
+        dest = _safe_staging_dest(dest_dir, rel_clean)
+        expected[rel_path] = dest
+        clean_lines.append(rel_clean)
+
+    src_root = _remote_path(remote, queue_dir)
+    list_file = None
+    t0 = time.time()
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", suffix=".txt", delete=False) as tf:
+            tf.write("\n".join(clean_lines) + "\n")
+            list_file = tf.name
+
+        logger.info(f"Batch-downloading {len(clean_lines)} PDF(s) from {src_root} (transfers={RCLONE_TRANSFERS}, checkers={RCLONE_CHECKERS})...")
+        args = [
+            "copy",
+            src_root,
+            dest_dir,
+            "--files-from-raw", list_file,
+            "--no-traverse",
+            "--transfers", str(RCLONE_TRANSFERS),
+            "--checkers", str(RCLONE_CHECKERS),
+        ]
+        res = run_rclone(args)
+        staged = {rel: path for rel, path in expected.items() if os.path.isfile(path)}
+        logger.info(
+            f"Batch download for {src_root} finished in {time.time() - t0:.1f}s "
+            f"({len(staged)}/{len(rel_paths)} files staged; rc={res.returncode})."
+        )
+        return staged
+    finally:
+        if list_file and os.path.exists(list_file):
+            try:
+                os.remove(list_file)
+            except OSError:
+                pass
+
+
+class RcloneDaemon:
+    """Long-lived rclone rcd server keeping Google Drive's directory-ID cache warm across fast server-side moves."""
+
+    def __init__(self):
+        self.proc: Optional[subprocess.Popen] = None
+        self.base_url: Optional[str] = None
+        self._local = threading.local()
+
+    def _session(self) -> requests.Session:
+        sess = getattr(self._local, "session", None)
+        if sess is None:
+            sess = requests.Session()
+            self._local.session = sess
+        return sess
+
+    def start(self) -> bool:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(("127.0.0.1", 0))
+                port = s.getsockname()[1]
+        except OSError as e:
+            logger.warning(f"Could not allocate port for rclone rcd ({e}); falling back to subprocess moves.")
+            return False
+
+        addr = f"127.0.0.1:{port}"
+        cmd = [
+            "rclone", "rcd",
+            "--rc-no-auth",
+            "--rc-addr", addr,
+            "--dir-cache-time", "60m",
+            "--tpslimit", str(RCLONE_TPSLIMIT),
+            "--tpslimit-burst", str(RCLONE_TPSLIMIT_BURST),
+            "--drive-pacer-min-sleep", str(RCLONE_DRIVE_PACER_MIN_SLEEP),
+            "--retries", "3",
+            "--retries-sleep", "5s",
+            "--low-level-retries", "8",
+        ]
+        try:
+            self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as e:
+            logger.warning(f"Failed to start rclone rcd ({e}); falling back to subprocess moves.")
+            return False
+
+        self.base_url = f"http://{addr}"
+        deadline = time.time() + 10.0
+        while time.time() < deadline:
+            if self.proc.poll() is not None:
+                logger.warning("rclone rcd exited unexpectedly; falling back to subprocess moves.")
+                self.proc = None
+                self.base_url = None
+                return False
+            try:
+                resp = self._session().post(f"{self.base_url}/rc/noop", json={}, timeout=1.0)
+                if resp.status_code == 200:
+                    logger.info(f"Started warm rclone rcd daemon on {addr} (dir-cache-time=60m).")
+                    return True
+            except requests.RequestException:
+                time.sleep(0.2)
+
+        logger.warning("Timed out waiting for rclone rcd; falling back to subprocess moves.")
+        self.stop()
+        return False
+
+    def stop(self):
+        if self.proc is not None:
+            try:
+                self.proc.terminate()
+                self.proc.wait(timeout=5)
+            except Exception:
+                try:
+                    self.proc.kill()
+                except Exception:
+                    pass
+            self.proc = None
+        self.base_url = None
+
+    def move_file(self, src_fs: str, src_remote: str, dst_fs: str, dst_remote: str) -> bool:
+        if not self.base_url or (self.proc is not None and self.proc.poll() is not None):
+            return False
+
+        payload = {
+            "srcFs": src_fs,
+            "srcRemote": src_remote,
+            "dstFs": dst_fs,
+            "dstRemote": dst_remote,
+        }
+        for attempt in range(RCLONE_MAX_RETRIES + 1):
+            try:
+                resp = self._session().post(f"{self.base_url}/operations/movefile", json=payload, timeout=90)
+                if resp.status_code == 200:
+                    return True
+                err_text = resp.text.strip()
+                if is_rate_limit_error(err_text) and attempt < RCLONE_MAX_RETRIES:
+                    delay = min(RCLONE_BACKOFF_BASE * (2 ** attempt), RCLONE_BACKOFF_MAX) + random.uniform(0.5, 2.0)
+                    logger.warning(f"rclone rcd rate limit on movefile (attempt {attempt + 1}/{RCLONE_MAX_RETRIES + 1}); sleeping {delay:.1f}s...")
+                    time.sleep(delay)
+                    continue
+                logger.warning(f"rclone rcd movefile failed (HTTP {resp.status_code}): {err_text[:300]}")
+                return False
+            except requests.RequestException as e:
+                logger.warning(f"rclone rcd request error ({e}); will fall back to subprocess moveto.")
+                return False
+        return False
+
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.stop()
 
 
 def remote_file_exists(remote: str, folder: str, filename: str) -> bool:
@@ -286,22 +468,40 @@ def move_file_in_drive(
     rel_path: str,
     content_hash: Optional[str] = None,
     known_processed: Optional[Set[str]] = None,
+    rc_daemon: Optional[RcloneDaemon] = None,
+    processed_lock: Optional[threading.Lock] = None,
 ) -> bool:
     """Moves a processed file (from root or any subfolder) flat into processed_dir without overwriting existing files."""
     rel_clean = rel_path.replace("\\", "/").lstrip("/")
     basename = os.path.basename(rel_clean)
-    dest_name = resolve_flattened_processed_name(
-        remote, processed_dir, basename, content_hash=content_hash, known_processed=known_processed
-    )
+    if processed_lock is not None:
+        with processed_lock:
+            dest_name = resolve_flattened_processed_name(
+                remote, processed_dir, basename, content_hash=content_hash, known_processed=known_processed
+            )
+            if known_processed is not None:
+                known_processed.add(dest_name)
+    else:
+        dest_name = resolve_flattened_processed_name(
+            remote, processed_dir, basename, content_hash=content_hash, known_processed=known_processed
+        )
+        if known_processed is not None:
+            known_processed.add(dest_name)
+
     src = _remote_path(remote, f"{queue_dir}/{rel_clean}")
     dest = _remote_path(remote, f"{processed_dir}/{dest_name}")
     logger.info(f"Moving {src} -> {dest}...")
+
+    if rc_daemon is not None and rc_daemon.base_url:
+        src_fs = _remote_path(remote, queue_dir)
+        dst_fs = _remote_path(remote, processed_dir)
+        if rc_daemon.move_file(src_fs, rel_clean, dst_fs, dest_name):
+            return True
+
     res = run_rclone(["moveto", src, dest])
     if res.returncode != 0:
         logger.error(f"Failed to move {rel_clean} in Google Drive to {processed_dir}")
         return False
-    if known_processed is not None:
-        known_processed.add(dest_name)
     return True
 
 
@@ -332,26 +532,39 @@ class MendeleyClient:
         self.refresh_token = refresh_token
         self.access_token = None
         self.token_expiry = 0
+        self._token_lock = threading.Lock()
+        self._local = threading.local()
 
-    def refresh_access_token(self):
-        logger.info("Refreshing Mendeley OAuth access token...")
-        payload = {
-            "grant_type": "refresh_token",
-            "refresh_token": self.refresh_token,
-            "client_id": self.client_id,
-            "client_secret": self.client_secret,
-            "scope": "all"
-        }
-        resp = requests.post(MENDELEY_TOKEN_URL, data=payload, timeout=20)
-        if resp.status_code == 200:
-            data = resp.json()
-            self.access_token = data["access_token"]
-            expires_in = data.get("expires_in", 3600)
-            self.token_expiry = time.time() + expires_in - 60
-            logger.info("Mendeley access token refreshed successfully.")
-            return self.access_token
-        else:
-            raise RuntimeError(f"Authentication Failed: {resp.status_code} {resp.text}")
+    def _session(self) -> requests.Session:
+        sess = getattr(self._local, "session", None)
+        if sess is None:
+            sess = requests.Session()
+            self._local.session = sess
+        return sess
+
+    def refresh_access_token(self, failed_token: Optional[str] = None):
+        with self._token_lock:
+            # Another worker may have already refreshed while we waited on the lock
+            if failed_token and self.access_token and self.access_token != failed_token and time.time() < self.token_expiry:
+                return self.access_token
+            logger.info("Refreshing Mendeley OAuth access token...")
+            payload = {
+                "grant_type": "refresh_token",
+                "refresh_token": self.refresh_token,
+                "client_id": self.client_id,
+                "client_secret": self.client_secret,
+                "scope": "all"
+            }
+            resp = self._session().post(MENDELEY_TOKEN_URL, data=payload, timeout=20)
+            if resp.status_code == 200:
+                data = resp.json()
+                self.access_token = data["access_token"]
+                expires_in = data.get("expires_in", 3600)
+                self.token_expiry = time.time() + expires_in - 60
+                logger.info("Mendeley access token refreshed successfully.")
+                return self.access_token
+            else:
+                raise RuntimeError(f"Authentication Failed: {resp.status_code} {resp.text}")
 
     def get_token(self):
         if not self.access_token or time.time() >= self.token_expiry:
@@ -361,28 +574,35 @@ class MendeleyClient:
     def _request_with_retry(self, method: str, url: str, **kwargs) -> requests.Response:
         max_retries = 5
         backoff = 5.0
+        base_headers = dict(kwargs.pop("headers", {}) or {})
         for attempt in range(max_retries):
             token = self.get_token()
-            headers = kwargs.get("headers", {})
+            headers = dict(base_headers)
             headers["Authorization"] = f"Bearer {token}"
-            kwargs["headers"] = headers
 
             try:
-                resp = requests.request(method, url, **kwargs)
+                resp = self._session().request(method, url, headers=headers, **kwargs)
                 if resp.status_code == 401:
                     logger.warning("Token expired mid-request. Refreshing token...")
-                    self.refresh_access_token()
+                    self.refresh_access_token(failed_token=token)
                     continue
                 elif resp.status_code == 429:
-                    logger.warning(f"Rate limited by Mendeley (HTTP 429). Retrying in {backoff}s (attempt {attempt+1}/{max_retries})...")
-                    time.sleep(backoff)
-                    backoff *= 2.0
+                    retry_after = resp.headers.get("Retry-After")
+                    wait_s = backoff
+                    if retry_after:
+                        try:
+                            wait_s = max(float(retry_after), 1.0)
+                        except ValueError:
+                            pass
+                    logger.warning(f"Rate limited by Mendeley (HTTP 429). Retrying in {wait_s:.1f}s (attempt {attempt+1}/{max_retries})...")
+                    time.sleep(wait_s)
+                    backoff = min(backoff * 2.0, 60.0)
                     continue
                 return resp
             except (requests.ConnectionError, requests.Timeout) as e:
-                logger.warning(f"Network error ({e}). Retrying in {backoff}s...")
+                logger.warning(f"Network error ({e}). Retrying in {backoff:.1f}s...")
                 time.sleep(backoff)
-                backoff *= 2.0
+                backoff = min(backoff * 2.0, 60.0)
 
         raise RuntimeError(f"Request failed after {max_retries} attempts: {method} {url}")
 
@@ -496,10 +716,27 @@ def main():
     batch_files = pending_items[:MAX_FILES]
     has_more = total_pending > MAX_FILES
 
+    # Group batch files per queue for single-shot parallel rclone downloads
+    queue_rel_paths: Dict[str, List[str]] = {}
+    for q_dir, rel_path in batch_files:
+        queue_rel_paths.setdefault(q_dir, []).append(rel_path)
+
+    active_queues = sorted(queue_rel_paths.keys())
+
     # Pre-load Processed/ filename caches once per active queue to avoid per-file Drive API lookups
     processed_caches: Dict[str, Optional[Set[str]]] = {}
-    for q_dir in sorted({q for q, _ in batch_files}):
+    processed_locks: Dict[str, threading.Lock] = {}
+    queue_staging_dirs: Dict[str, str] = {}
+    pre_staged: Dict[Tuple[str, str], str] = {}
+
+    for q_idx, q_dir in enumerate(active_queues):
         processed_caches[q_dir] = list_processed_filenames(GDRIVE_REMOTE, f"{q_dir}/Processed")
+        processed_locks[q_dir] = threading.Lock()
+        q_stage = os.path.join(LOCAL_STAGING_DIR, f"q_{q_idx}")
+        queue_staging_dirs[q_dir] = q_stage
+        staged_map = batch_download_from_drive(GDRIVE_REMOTE, q_dir, queue_rel_paths[q_dir], q_stage)
+        for rel_path, local_path in staged_map.items():
+            pre_staged[(q_dir, rel_path)] = local_path
 
     stats = {
         "scanned": len(batch_files),
@@ -507,16 +744,37 @@ def main():
         "skipped": 0,
         "errors": list(scan_failures),
     }
-    records_summary = []
+    records_summary: List[Dict[str, str]] = []
+    manifest_lock = threading.Lock()
+    stats_lock = threading.Lock()
+    manifest_dirty_count = 0
+    stop_event = threading.Event()
+    hit_runtime_ceiling = False
 
-    for idx, (q_dir, rel_path) in enumerate(batch_files, 1):
-        p_dir = f"{q_dir}/Processed"
-        known_processed = processed_caches.get(q_dir)
+    def _record_manifest_entry(sha256_hex: str, entry: Dict[str, Any]):
+        nonlocal manifest_dirty_count
+        with manifest_lock:
+            manifest[sha256_hex] = entry
+            manifest_dirty_count += 1
+            if manifest_dirty_count >= MANIFEST_SAVE_INTERVAL:
+                save_manifest(MANIFEST_PATH, manifest)
+                manifest_dirty_count = 0
+
+    def _process_one(idx: int, q_dir: str, rel_path: str, rc_daemon: Optional[RcloneDaemon]):
+        nonlocal hit_runtime_ceiling
+        if stop_event.is_set():
+            return
         elapsed = time.time() - START_TIME
         if elapsed > MAX_RUNTIME_SECONDS:
             logger.warning(f"Approaching runtime ceiling ({elapsed:.1f}s > {MAX_RUNTIME_SECONDS}s). Stopping batch gracefully.")
-            has_more = True
-            break
+            hit_runtime_ceiling = True
+            stop_event.set()
+            return
+
+        p_dir = f"{q_dir}/Processed"
+        known_processed = processed_caches.get(q_dir)
+        p_lock = processed_locks.get(q_dir)
+        q_stage = queue_staging_dirs[q_dir]
 
         file_start = time.time()
         basename = os.path.basename(rel_path)
@@ -524,34 +782,41 @@ def main():
         display_path = f"{q_dir}/{rel_path}"
         logger.info(f"[{idx}/{len(batch_files)}] Processing ({q_dir}): {rel_path} ('{title}')")
 
-        local_path = None
+        local_path = pre_staged.get((q_dir, rel_path))
         try:
-            # 1. Download file
-            local_path = download_file_from_drive(GDRIVE_REMOTE, q_dir, rel_path, LOCAL_STAGING_DIR)
+            # 1. Ensure file is staged locally (fallback to single download if batch missed it)
+            if not local_path or not os.path.isfile(local_path):
+                local_path = download_file_from_drive(GDRIVE_REMOTE, q_dir, rel_path, q_stage)
 
             # 2. Compute local hashes
             local_sha1, local_sha256 = calculate_file_hashes(local_path)
             file_size_mb = os.path.getsize(local_path) / (1024 * 1024)
 
             # 3. Deduplication Tier 2 (Content SHA-256 in manifest)
-            if local_sha256 in manifest:
-                existing = manifest[local_sha256]
+            with manifest_lock:
+                existing = manifest.get(local_sha256)
+            if existing is not None:
                 logger.info(f"⏭️ Deduplication Tier 2 Match: Content hash {local_sha256[:12]}... already uploaded as '{existing.get('title')}' (doc_id={existing.get('mendeley_doc_id')}). Skipping.")
-                move_file_in_drive(GDRIVE_REMOTE, q_dir, p_dir, rel_path, content_hash=local_sha256, known_processed=known_processed)
-                stats["skipped"] += 1
-                records_summary.append({
-                    "file": display_path,
-                    "status": "Skipped (Content Hash Match)",
-                    "doc_id": existing.get("mendeley_doc_id", "Existing"),
-                    "duration": f"{time.time() - file_start:.1f}s"
-                })
-                continue
+                move_file_in_drive(
+                    GDRIVE_REMOTE, q_dir, p_dir, rel_path,
+                    content_hash=local_sha256, known_processed=known_processed,
+                    rc_daemon=rc_daemon, processed_lock=p_lock,
+                )
+                with stats_lock:
+                    stats["skipped"] += 1
+                    records_summary.append({
+                        "file": display_path,
+                        "status": "Skipped (Content Hash Match)",
+                        "doc_id": existing.get("mendeley_doc_id", "Existing"),
+                        "duration": f"{time.time() - file_start:.1f}s"
+                    })
+                return
 
             # 4. Deduplication Tier 3 (Catalog title pre-flight check)
             existing_doc_id = mendeley.find_catalog_document_by_title(title)
             if existing_doc_id:
                 logger.info(f"⏭️ Deduplication Tier 3 Match: Document '{title}' already exists in Mendeley with attached file (doc_id={existing_doc_id}). Skipping.")
-                manifest[local_sha256] = {
+                _record_manifest_entry(local_sha256, {
                     "filename": basename,
                     "source_path": display_path,
                     "title": title,
@@ -559,17 +824,21 @@ def main():
                     "mendeley_file_id": "catalog_existing",
                     "mendeley_filehash": local_sha1,
                     "uploaded_at": datetime.now(timezone.utc).isoformat()
-                }
-                save_manifest(MANIFEST_PATH, manifest)
-                move_file_in_drive(GDRIVE_REMOTE, q_dir, p_dir, rel_path, content_hash=local_sha256, known_processed=known_processed)
-                stats["skipped"] += 1
-                records_summary.append({
-                    "file": display_path,
-                    "status": "Skipped (Catalog Title Match)",
-                    "doc_id": existing_doc_id,
-                    "duration": f"{time.time() - file_start:.1f}s"
                 })
-                continue
+                move_file_in_drive(
+                    GDRIVE_REMOTE, q_dir, p_dir, rel_path,
+                    content_hash=local_sha256, known_processed=known_processed,
+                    rc_daemon=rc_daemon, processed_lock=p_lock,
+                )
+                with stats_lock:
+                    stats["skipped"] += 1
+                    records_summary.append({
+                        "file": display_path,
+                        "status": "Skipped (Catalog Title Match)",
+                        "doc_id": existing_doc_id,
+                        "duration": f"{time.time() - file_start:.1f}s"
+                    })
+                return
 
             # 5. Create Document
             doc_id = mendeley.create_document(title)
@@ -586,7 +855,7 @@ def main():
                 logger.info(f"Upload confirmed (201 Created, file_id={mendeley_file_id}).")
 
             # 8. Record in Manifest Ledger
-            manifest[local_sha256] = {
+            _record_manifest_entry(local_sha256, {
                 "filename": basename,
                 "source_path": display_path,
                 "title": title,
@@ -595,43 +864,67 @@ def main():
                 "mendeley_filehash": mendeley_filehash or local_sha1,
                 "size_mb": round(file_size_mb, 2),
                 "uploaded_at": datetime.now(timezone.utc).isoformat()
-            }
-            save_manifest(MANIFEST_PATH, manifest)
+            })
 
             # 9. Move file flat into Processed/ in Google Drive
-            move_file_in_drive(GDRIVE_REMOTE, q_dir, p_dir, rel_path, content_hash=local_sha256, known_processed=known_processed)
+            move_file_in_drive(
+                GDRIVE_REMOTE, q_dir, p_dir, rel_path,
+                content_hash=local_sha256, known_processed=known_processed,
+                rc_daemon=rc_daemon, processed_lock=p_lock,
+            )
 
             duration_s = time.time() - file_start
             logger.info(f"SUCCESS: {display_path} uploaded in {duration_s:.1f}s (doc_id={doc_id})")
-            stats["uploaded"] += 1
-            records_summary.append({
-                "file": display_path,
-                "status": "✅ Uploaded",
-                "doc_id": doc_id,
-                "duration": f"{duration_s:.1f}s"
-            })
+            with stats_lock:
+                stats["uploaded"] += 1
+                records_summary.append({
+                    "file": display_path,
+                    "status": "✅ Uploaded",
+                    "doc_id": doc_id,
+                    "duration": f"{duration_s:.1f}s"
+                })
 
-            # Polite pacing between books
-            time.sleep(2.0)
+            if FILE_PACE_SECONDS > 0:
+                time.sleep(FILE_PACE_SECONDS)
 
         except Exception as e:
             duration_s = time.time() - file_start
             logger.error(f"ERROR on {display_path}: {str(e)}")
-            stats["errors"].append({"file": display_path, "error": str(e)})
-            records_summary.append({
-                "file": display_path,
-                "status": "❌ Failed",
-                "doc_id": "N/A",
-                "duration": f"{duration_s:.1f}s"
-            })
-            # Brief pause after failures so we don't hammer Google Drive in a tight loop
-            time.sleep(3.0)
+            with stats_lock:
+                stats["errors"].append({"file": display_path, "error": str(e)})
+                records_summary.append({
+                    "file": display_path,
+                    "status": "❌ Failed",
+                    "doc_id": "N/A",
+                    "duration": f"{duration_s:.1f}s"
+                })
+            time.sleep(1.0)
 
         finally:
-            cleanup_staging_file(local_path, LOCAL_STAGING_DIR)
+            cleanup_staging_file(local_path, q_stage)
 
-    # Save final manifest
-    save_manifest(MANIFEST_PATH, manifest)
+    logger.info(f"Processing {len(batch_files)} file(s) with UPLOAD_WORKERS={UPLOAD_WORKERS} (tpslimit={RCLONE_TPSLIMIT}, burst={RCLONE_TPSLIMIT_BURST})...")
+
+    daemon_ctx = RcloneDaemon() if GDRIVE_REMOTE else None
+    try:
+        if daemon_ctx is not None:
+            daemon_ctx.start()
+        with ThreadPoolExecutor(max_workers=UPLOAD_WORKERS) as pool:
+            futures = [
+                pool.submit(_process_one, idx, q_dir, rel_path, daemon_ctx)
+                for idx, (q_dir, rel_path) in enumerate(batch_files, 1)
+            ]
+            for fut in as_completed(futures):
+                fut.result()
+    finally:
+        if daemon_ctx is not None:
+            daemon_ctx.stop()
+        # Save final manifest
+        with manifest_lock:
+            save_manifest(MANIFEST_PATH, manifest)
+
+    if hit_runtime_ceiling:
+        has_more = True
 
     # Step Summary & Output
     total_duration = time.time() - START_TIME

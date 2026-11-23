@@ -14,7 +14,12 @@ on:
       max_files:
         description: 'Maximum PDFs to process in this run'
         required: false
-        default: '100'
+        default: '500'
+        type: string
+      upload_workers:
+        description: 'Concurrent Mendeley upload workers'
+        required: false
+        default: '4'
         type: string
       auto_continue:
         description: 'Automatically trigger follow-up run if more files remain'
@@ -70,7 +75,8 @@ jobs:
           MENDELEY_CLIENT_SECRET: ${{ secrets.MENDELEY_CLIENT_SECRET }}
           MENDELEY_REFRESH_TOKEN: ${{ secrets.MENDELEY_REFRESH_TOKEN }}
           GDRIVE_QUEUE_FOLDER: ${{ inputs.queue_folder || 'Mendeley_Queue,books1/chapters' }}
-          MAX_FILES_PER_RUN: ${{ inputs.max_files || '100' }}
+          MAX_FILES_PER_RUN: ${{ inputs.max_files || '500' }}
+          UPLOAD_WORKERS: ${{ inputs.upload_workers || '4' }}
         run: |
           python sync_drive_to_mendeley.py
 

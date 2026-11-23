@@ -130,6 +130,63 @@ class TestDriveSyncSubfolders(unittest.TestCase):
             )
         self.assertEqual(name, "01_Chapter_abcdef12.pdf")
 
+    def test_batch_download_from_drive_nested_and_special_chars(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            queue_dir = root / "queue"
+            staging_dir = root / "staging"
+            _write_file(queue_dir, "top.pdf", b"%PDF top")
+            _write_file(queue_dir, "BookA/01_Chapter [1], Part (A).pdf", b"%PDF special")
+            _write_file(queue_dir, "BookB/ignored.pdf", b"%PDF ignored")
+
+            staged = sync_mod.batch_download_from_drive(
+                "",
+                str(queue_dir),
+                ["top.pdf", "BookA/01_Chapter [1], Part (A).pdf"],
+                str(staging_dir),
+            )
+            self.assertEqual(set(staged.keys()), {"top.pdf", "BookA/01_Chapter [1], Part (A).pdf"})
+            self.assertEqual(Path(staged["top.pdf"]).read_bytes(), b"%PDF top")
+            self.assertEqual(Path(staged["BookA/01_Chapter [1], Part (A).pdf"]).read_bytes(), b"%PDF special")
+            self.assertFalse((staging_dir / "BookB").exists())
+
+    def test_move_file_in_drive_uses_rc_daemon_and_falls_back(self):
+        fake_daemon = mock.Mock()
+        fake_daemon.base_url = "http://127.0.0.1:9999"
+        fake_daemon.move_file.return_value = True
+        cache = set()
+
+        with mock.patch.object(sync_mod, "run_rclone", side_effect=AssertionError("should use daemon")):
+            ok = sync_mod.move_file_in_drive(
+                "gdrive",
+                "Mendeley_Queue",
+                "Mendeley_Queue/Processed",
+                "Nested/ch1.pdf",
+                content_hash="deadbeef",
+                known_processed=cache,
+                rc_daemon=fake_daemon,
+            )
+        self.assertTrue(ok)
+        fake_daemon.move_file.assert_called_once_with(
+            "gdrive:Mendeley_Queue", "Nested/ch1.pdf", "gdrive:Mendeley_Queue/Processed", "ch1.pdf"
+        )
+        self.assertIn("ch1.pdf", cache)
+
+        # Verify fallback to subprocess moveto when daemon returns False
+        fake_daemon.move_file.return_value = False
+        with mock.patch.object(sync_mod, "run_rclone", return_value=mock.Mock(returncode=0)) as m_rc:
+            ok2 = sync_mod.move_file_in_drive(
+                "gdrive",
+                "Mendeley_Queue",
+                "Mendeley_Queue/Processed",
+                "Nested/ch2.pdf",
+                content_hash="cafebabe",
+                known_processed=cache,
+                rc_daemon=fake_daemon,
+            )
+        self.assertTrue(ok2)
+        m_rc.assert_called_once_with(["moveto", "gdrive:Mendeley_Queue/Nested/ch2.pdf", "gdrive:Mendeley_Queue/Processed/ch2.pdf"])
+
 
 class TestLocalUploaderSubfolders(unittest.TestCase):
     def test_collect_pdf_files_recursive_and_non_recursive(self):

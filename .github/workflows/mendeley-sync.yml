@@ -104,25 +104,43 @@ jobs:
 
       - name: Send Email Notification (Only When PDFs Uploaded)
         if: success() && steps.sync.outputs.uploaded_count != '0' && steps.sync.outputs.uploaded_count != ''
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           RUN_URL: "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
         run: |
           python3 - <<'PY'
-          import json, os, urllib.request
+          import json, os, urllib.error, urllib.request
 
           token = os.environ["GH_TOKEN"]
           repo = os.environ["REPO"]
           run_url = os.environ["RUN_URL"]
           title = "📚 Mendeley Upload Digest"
+          MAX_BODY_CHARS = 60000
 
           summary = "New PDFs were uploaded from Google Drive to Mendeley."
           if os.path.exists("run_summary.md"):
               with open("run_summary.md", "r", encoding="utf-8") as f:
                   summary = f.read().strip()
 
-          body = f"cc @georgetalamantez\n\n{summary}\n\n🔗 **Workflow Run:** [{run_url}]({run_url})"
+          prefix = "cc @georgetalamantez\n\n"
+          footer = f"\n\n🔗 **Workflow Run:** [{run_url}]({run_url})"
+          trunc_notice = (
+              "\n\n_...table truncated to stay within GitHub's 65,536-character comment limit. "
+              "See the full summary and `mendeley-sync-logs` artifact in the workflow run below._"
+          )
+
+          max_summary_len = MAX_BODY_CHARS - len(prefix) - len(footer)
+          if len(summary) > max_summary_len:
+              cutoff = max(0, max_summary_len - len(trunc_notice))
+              cut_text = summary[:cutoff]
+              last_nl = cut_text.rfind("\n")
+              if last_nl > 0:
+                  cut_text = cut_text[:last_nl]
+              summary = cut_text.rstrip() + trunc_notice
+
+          body = f"{prefix}{summary}{footer}"
 
           def gh_api(path, method="GET", payload=None):
               url = f"https://api.github.com/repos/{repo}/{path.lstrip('/')}"
@@ -135,8 +153,13 @@ jobs:
               if data:
                   headers["Content-Type"] = "application/json"
               req = urllib.request.Request(url, data=data, headers=headers, method=method)
-              with urllib.request.urlopen(req) as resp:
-                  return json.loads(resp.read().decode("utf-8"))
+              try:
+                  with urllib.request.urlopen(req) as resp:
+                      return json.loads(resp.read().decode("utf-8"))
+              except urllib.error.HTTPError as exc:
+                  err_body = exc.read().decode("utf-8", errors="replace")
+                  print(f"GitHub API error {exc.code} on {method} {url}: {err_body}")
+                  raise
 
           issues = gh_api("issues?state=open&per_page=50")
           digest_issue = next((i for i in issues if i.get("title") == title and "pull_request" not in i), None)
@@ -149,7 +172,7 @@ jobs:
               print(f"Created tracking issue #{digest_issue['number']}")
 
           comment = gh_api(f"issues/{digest_issue['number']}/comments", method="POST", payload={"body": body})
-          print(f"Posted Mendeley upload digest comment to issue #{digest_issue['number']}: {comment.get('html_url')}")
+          print(f"Posted Mendeley upload digest comment to issue #{digest_issue['number']} ({len(body)} chars): {comment.get('html_url')}")
           PY
 
       - name: Trigger Follow-Up Run (If Queue Has Remaining Files)

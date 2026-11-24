@@ -965,7 +965,10 @@ def write_step_summary(total_scanned: int, uploaded: int, skipped: int, errors: 
         lines.append("")
         lines.append("### ⚠️ Error Log")
         for err in errors:
-            lines.append(f"- **`{err['file']}`**: `{err['error']}`")
+            clean_err = " ".join(str(err["error"]).split())
+            if len(clean_err) > 300:
+                clean_err = clean_err[:297] + "..."
+            lines.append(f"- **`{err['file']}`**: `{clean_err}`")
 
     summary_md = "\n".join(lines) + "\n"
     try:

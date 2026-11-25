@@ -182,4 +182,14 @@ jobs:
         run: |
           echo "Queue has remaining files. Triggering subsequent workflow run..."
           sleep 15
-          gh workflow run mendeley-sync.yml
+          for attempt in 1 2 3 4 5; do
+            if gh workflow run mendeley-sync.yml; then
+              echo "Follow-up workflow triggered on attempt $attempt."
+              exit 0
+            fi
+            delay=$((attempt * 20))
+            echo "gh workflow run failed on attempt $attempt; retrying in ${delay}s..."
+            sleep "$delay"
+          done
+          echo "::error::Failed to trigger follow-up workflow run after 5 attempts."
+          exit 1

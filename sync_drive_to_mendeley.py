@@ -10,6 +10,7 @@ Features:
 """
 
 import os
+import re
 import sys
 import time
 import json
@@ -21,6 +22,7 @@ import logging
 import tempfile
 import threading
 import subprocess
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional, Set, Tuple
@@ -524,6 +526,47 @@ def cleanup_staging_file(local_path: Optional[str], staging_root: str):
             break
 
 
+def sanitize_header_filename(filename: str) -> str:
+    """Returns a strict printable-ASCII filename safe for HTTP Content-Disposition headers.
+
+    Prevents Python latin-1 encoding errors (e.g., en-dash, curly quotes) and
+    Cloudflare WAF 403 rejections caused by raw non-ASCII bytes (e.g., NBSP 0xA0).
+    """
+    clean = os.path.basename(filename.replace("\\", "/")).strip()
+    replacements = {
+        "\u00a0": " ",
+        "\u2000": " ",
+        "\u2001": " ",
+        "\u2002": " ",
+        "\u2003": " ",
+        "\u2009": " ",
+        "\u202f": " ",
+        "\u2010": "-",
+        "\u2011": "-",
+        "\u2012": "-",
+        "\u2013": "-",
+        "\u2014": "-",
+        "\u2015": "-",
+        "\u2212": "-",
+        "\u2018": "'",
+        "\u2019": "'",
+        "\u201c": "",
+        "\u201d": "",
+    }
+    clean = "".join(replacements.get(ch, ch) for ch in clean)
+    clean = unicodedata.normalize("NFKD", clean).encode("ascii", "ignore").decode("ascii")
+    clean = re.sub(r'["\\;\r\n\t]+', " ", clean)
+    clean = re.sub(r'[^A-Za-z0-9._() \-]+', "_", clean)
+    clean = re.sub(r"\s+", " ", clean).strip(" ._")
+    if not clean:
+        clean = "document.pdf"
+    if not clean.lower().endswith(".pdf"):
+        clean = f"{clean}.pdf"
+    if len(clean) > 180:
+        clean = clean[:176].rstrip(" ._") + ".pdf"
+    return clean
+
+
 # --- Mendeley API Client ---
 class MendeleyClient:
     def __init__(self, client_id: str, client_secret: str, refresh_token: str):
@@ -639,14 +682,27 @@ class MendeleyClient:
             return doc_id
         raise RuntimeError(f"Failed to create document '{title}': {resp.status_code} - {resp.text}")
 
+    def delete_document(self, document_id: str) -> bool:
+        """Deletes a document (used to clean up orphan metadata-only docs if binary upload fails)."""
+        try:
+            resp = self._request_with_retry("DELETE", f"{MENDELEY_DOCS_URL}/{document_id}", timeout=30)
+            if resp.status_code in (200, 204, 404):
+                logger.info(f"Cleaned up orphan document: id={document_id}")
+                return True
+            logger.warning(f"Failed to delete orphan document {document_id}: HTTP {resp.status_code}")
+        except Exception as e:
+            logger.warning(f"Error deleting orphan document {document_id}: {e}")
+        return False
+
     def upload_file_content(self, document_id: str, file_path: str) -> Dict[str, Any]:
         """Uploads binary PDF and captures Mendeley server response."""
-        filename = os.path.basename(file_path)
+        raw_filename = os.path.basename(file_path)
+        safe_filename = sanitize_header_filename(raw_filename)
         headers = {
             "Content-Type": "application/pdf",
             "Accept": "application/vnd.mendeley-file.1+json",
             "Link": f"<{MENDELEY_DOCS_URL}/{document_id}>; rel=\"document\"",
-            "Content-Disposition": f'attachment; filename="{filename}"'
+            "Content-Disposition": f'attachment; filename="{safe_filename}"'
         }
         with open(file_path, "rb") as f:
             file_bytes = f.read()
@@ -661,7 +717,7 @@ class MendeleyClient:
             if "id" not in file_info and "Location" in resp.headers:
                 file_info["id"] = resp.headers["Location"].rstrip("/").split("/")[-1]
             return file_info
-        raise RuntimeError(f"Failed to upload file '{filename}': {resp.status_code} - {resp.text}")
+        raise RuntimeError(f"Failed to upload file '{raw_filename}' (header='{safe_filename}'): {resp.status_code} - {resp.text}")
 
 
 # --- Main Orchestration Loop ---
@@ -783,6 +839,7 @@ def main():
         logger.info(f"[{idx}/{len(batch_files)}] Processing ({q_dir}): {rel_path} ('{title}')")
 
         local_path = pre_staged.get((q_dir, rel_path))
+        created_doc_id: Optional[str] = None
         try:
             # 1. Ensure file is staged locally (fallback to single download if batch missed it)
             if not local_path or not os.path.isfile(local_path):
@@ -842,9 +899,11 @@ def main():
 
             # 5. Create Document
             doc_id = mendeley.create_document(title)
+            created_doc_id = doc_id
 
             # 6. Upload Binary
             file_info = mendeley.upload_file_content(doc_id, local_path)
+            created_doc_id = None  # Binary attached successfully; no longer an orphan
             mendeley_filehash = file_info.get("filehash")
             mendeley_file_id = file_info.get("id", "confirmed")
 
@@ -888,6 +947,8 @@ def main():
                 time.sleep(FILE_PACE_SECONDS)
 
         except Exception as e:
+            if created_doc_id:
+                mendeley.delete_document(created_doc_id)
             duration_s = time.time() - file_start
             logger.error(f"ERROR on {display_path}: {str(e)}")
             with stats_lock:
@@ -930,6 +991,16 @@ def main():
     total_duration = time.time() - START_TIME
     write_step_summary(stats["scanned"], stats["uploaded"], stats["skipped"], stats["errors"], records_summary, total_duration, len(manifest))
     set_github_output("uploaded_count", str(stats["uploaded"]))
+
+    # Guard against infinite retry loops when zero files made progress
+    progressed = stats["uploaded"] + stats["skipped"]
+    if has_more and progressed == 0 and len(stats["errors"]) > 0:
+        logger.error(
+            f"Zero files progressed in this batch ({len(stats['errors'])} errors). "
+            "Halting auto-continuation to prevent an infinite failure loop."
+        )
+        set_github_output("has_more_files", "false")
+        sys.exit(1)
 
     if has_more:
         logger.info("Remaining files detected in queue. Signaling auto-continuation.")
